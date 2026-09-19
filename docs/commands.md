@@ -103,10 +103,16 @@ which is how a recording says it has a gap.
 Writes a RIFF WAV of the speaker, stereo 16-bit at 44.1 kHz. Frontends that
 cannot record refuse rather than producing a silent file.
 
-**It records wall-clock time, not emulated time.** The samples arrive when the
-host's sound card asks for them, so a `run_frames` that emulates ten seconds of
-Apple II in a tenth of a second wall-clock yields a tenth of a second of audio.
-Measured on the SDL3 frontend: 600 frames of emulation produced 0.12 s of WAV.
+**The two frontends time it differently, and one of them is what you want.**
+
+| | what a recording is as long as |
+|---|---|
+| headless | **emulated time.** 600 frames of emulation wrote 10.014 s of WAV against 10,219,093 cycles run - the same 10.014 s |
+| SDL3 | **wall-clock time**, because the samples reach the file from the sound card's callback. A `run_frames` that emulates ten seconds in a tenth of a second wall-clock yields a tenth of a second of audio; 600 frames measured 0.12 s |
+
+So a recording made while a tool drives the machine belongs to the headless
+build. The SDL3 one is for watching a session in real time, where the two
+agree anyway.
 
 To record sound for a length of emulated time, play it back at that speed —
 which is what `tas.py replay --video` does, pairing the dump with `screen_capture`

@@ -1,4 +1,4 @@
-From c843ff5a02f17a47dacdf0b8bbce3ec7fac5076c Mon Sep 17 00:00:00 2001
+From 1c2f2c92e0d9326ad2a55a833165ab6e70e5d746 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 01:40:44 +0900
 Subject: [PATCH 8/9] Mark a page an agent write changed, and ask the 6502
@@ -48,14 +48,14 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  src/apple2/Memory.cpp                        |  15 +
  src/apple2/Memory.h                          |   1 +
  src/frontends/common/agent/AgentCommands.cpp |  29 +-
- tests/test_agent_commands.cpp                | 273 +++++++++++++++++++
- 4 files changed, 314 insertions(+), 4 deletions(-)
+ tests/test_agent_commands.cpp                | 277 +++++++++++++++++++
+ 4 files changed, 318 insertions(+), 4 deletions(-)
 
 diff --git a/src/apple2/Memory.cpp b/src/apple2/Memory.cpp
-index b5fafb5..cb13c5f 100644
+index b10cf32..3b05fc3 100644
 --- a/src/apple2/Memory.cpp
 +++ b/src/apple2/Memory.cpp
-@@ -1044,6 +1044,21 @@ auto mem_get_cx_rom_peripheral() -> uint8_t* {
+@@ -1045,6 +1045,21 @@ auto mem_get_cx_rom_peripheral() -> uint8_t* {
  
  auto get_mem_ptr(uint16_t addr) -> uint8_t* { return mem + addr; }
  
@@ -78,10 +78,10 @@ index b5fafb5..cb13c5f 100644
  
  // Post:
 diff --git a/src/apple2/Memory.h b/src/apple2/Memory.h
-index 37da272..52d9a24 100644
+index 1c08bb9..cd238a5 100644
 --- a/src/apple2/Memory.h
 +++ b/src/apple2/Memory.h
-@@ -240,6 +240,7 @@ auto mem_get_aux_ptr(uint16_t addr) -> uint8_t*;
+@@ -239,6 +239,7 @@ auto mem_get_aux_ptr(uint16_t addr) -> uint8_t*;
  auto mem_get_main_ptr(uint16_t addr) -> uint8_t*;
  auto mem_get_cx_rom_peripheral() -> uint8_t*;
  auto get_mem_ptr(uint16_t addr) -> uint8_t*;
@@ -90,7 +90,7 @@ index 37da272..52d9a24 100644
  auto get_mem_mode() -> uint32_t;
  auto set_mem_mode(uint32_t mode) -> void;
 diff --git a/src/frontends/common/agent/AgentCommands.cpp b/src/frontends/common/agent/AgentCommands.cpp
-index 04e79b9..a5b5473 100644
+index a1349e7..2c60787 100644
 --- a/src/frontends/common/agent/AgentCommands.cpp
 +++ b/src/frontends/common/agent/AgentCommands.cpp
 @@ -164,6 +164,30 @@ auto memory_view_ptr(const std::string& view, uint16_t address) -> uint8_t* {
@@ -137,10 +137,10 @@ index 04e79b9..a5b5473 100644
      Json result;
      result["written"] = bytes.size();
 diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
-index bcc73cc..c182dcc 100644
+index 9bcc45c..4d31447 100644
 --- a/tests/test_agent_commands.cpp
 +++ b/tests/test_agent_commands.cpp
-@@ -163,16 +163,27 @@ auto base64_decode(const std::string& text) -> std::vector<uint8_t> {
+@@ -167,16 +167,27 @@ auto base64_decode(const std::string& text) -> std::vector<uint8_t> {
    return out;
  }
  
@@ -168,7 +168,7 @@ index bcc73cc..c182dcc 100644
  }
  
  // The joystick has no query of its own, so its save state is how a test sees
-@@ -528,6 +539,268 @@ TEST_CASE("Agent: mem_write refuses a payload it cannot place") {
+@@ -536,6 +547,272 @@ TEST_CASE("Agent: mem_write refuses a payload it cannot place") {
              .get<std::string>() == "3q2+7w==");
  }
  
@@ -282,7 +282,8 @@ index bcc73cc..c182dcc 100644
 +}  // namespace
 +
 +TEST_CASE("Agent: the running program agrees with a cpu-view read") {
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  mem_reset_paging();
 +
 +  constexpr uint8_t by_program = 0x11;
@@ -313,7 +314,8 @@ index bcc73cc..c182dcc 100644
 +}
 +
 +TEST_CASE("Agent: every language-card switch leaves cpu view telling truth") {
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  mem_reset_paging();
 +
 +  // Three different bytes in the three places $DA80 can be: the two banks the
@@ -356,7 +358,8 @@ index bcc73cc..c182dcc 100644
 +}
 +
 +TEST_CASE("Agent: the aux view is the bank the program wrote") {
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  mem_reset_paging();
 +
 +  // $C005 sends writes to the auxiliary bank and $C004 sends them back to
@@ -403,7 +406,8 @@ index bcc73cc..c182dcc 100644
 +}
 +
 +TEST_CASE("Agent: an aux write survives the page being swapped out") {
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  mem_reset_paging();
 +
 +  // The same trap as the language card, one bank over. While 80STORE and PAGE2
@@ -435,8 +439,8 @@ index bcc73cc..c182dcc 100644
 +}
 +
  TEST_CASE("Agent: disk_insert checks the drive and the path length") {
-   HeadlessHarness_t harness;
- 
+   TestConfig_t test_config(TestConfig_t::disk_ii_only());
+   HeadlessHarness_t harness(test_config);
 -- 
 2.53.0
 

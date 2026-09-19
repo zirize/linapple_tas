@@ -1,4 +1,4 @@
-From 71f33d86b924592b0ecaebd668140ee1217262cc Mon Sep 17 00:00:00 2001
+From 0047684173d1665d737a1b024b9e1ddd43fa2537 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 00:36:36 +0900
 Subject: [PATCH 7/9] Let a caller read the memory the program is actually
@@ -25,11 +25,11 @@ unknown name is refused rather than quietly treated as main.
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 ---
  src/frontends/common/agent/AgentCommands.cpp | 54 +++++++++++++++++---
- tests/test_agent_commands.cpp                | 32 ++++++++++++
- 2 files changed, 80 insertions(+), 6 deletions(-)
+ tests/test_agent_commands.cpp                | 33 ++++++++++++
+ 2 files changed, 81 insertions(+), 6 deletions(-)
 
 diff --git a/src/frontends/common/agent/AgentCommands.cpp b/src/frontends/common/agent/AgentCommands.cpp
-index d8560cc..04e79b9 100644
+index 528f139..a1349e7 100644
 --- a/src/frontends/common/agent/AgentCommands.cpp
 +++ b/src/frontends/common/agent/AgentCommands.cpp
 @@ -143,6 +143,42 @@ auto param_string(const Json& params, const char* key) -> std::string {
@@ -126,15 +126,16 @@ index d8560cc..04e79b9 100644
    }
  
 diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
-index 22a2a07..bcc73cc 100644
+index 160f416..9bcc45c 100644
 --- a/tests/test_agent_commands.cpp
 +++ b/tests/test_agent_commands.cpp
-@@ -476,6 +476,38 @@ TEST_CASE("Agent: mem_read returns what memory holds") {
+@@ -482,6 +482,39 @@ TEST_CASE("Agent: mem_read returns what memory holds") {
    CHECK(result.at("data").get<std::string>() == "3q2+7w==");
  }
  
 +TEST_CASE("Agent: mem_read can be asked which image to read") {
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +
 +  CHECK(rejects("mem_read", {{"addr", 0x6000}, {"view", "bogus"}}));
 +  CHECK(rejects("mem_write",
@@ -166,8 +167,8 @@ index 22a2a07..bcc73cc 100644
 +}
 +
  TEST_CASE("Agent: mem_write refuses a payload it cannot place") {
-   HeadlessHarness_t harness;
- 
+   TestConfig_t test_config(TestConfig_t::disk_ii_only());
+   HeadlessHarness_t harness(test_config);
 -- 
 2.53.0
 

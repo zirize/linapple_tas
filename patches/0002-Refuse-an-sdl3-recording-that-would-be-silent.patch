@@ -1,4 +1,4 @@
-From 5c1f06e4ef11977cc676779e7d13156ddbf2993b Mon Sep 17 00:00:00 2001
+From 3c3a8369bd107f963d10d547dad76acd66795d43 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Fri, 18 Sep 2026 13:58:31 +0900
 Subject: [PATCH 2/9] Refuse an sdl3 recording that would be silent
@@ -20,24 +20,34 @@ to ..." - neither left a file behind.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 ---
- src/frontends/sdl3/Main.cpp | 32 ++++++++++++++++++++++++--------
- 1 file changed, 24 insertions(+), 8 deletions(-)
+ src/frontends/sdl3/Main.cpp | 33 ++++++++++++++++++++++++++-------
+ 1 file changed, 26 insertions(+), 7 deletions(-)
 
 diff --git a/src/frontends/sdl3/Main.cpp b/src/frontends/sdl3/Main.cpp
-index 9852ac4..37a20b2 100644
+index 878d1cc..b7d0c53 100644
 --- a/src/frontends/sdl3/Main.cpp
 +++ b/src/frontends/sdl3/Main.cpp
-@@ -54,13 +54,21 @@ static void SDLCALL sdl3_audio_callback(void* userdata, SDL_AudioStream* stream,
+@@ -29,6 +29,9 @@ bool g_ds_available = false;
+ SDL_AudioStream* g_audioStream = nullptr;
+ static std::string g_audio_dump_file;
+ static AudioDumper_t g_audio_dumper;
++// The device's rate, kept because a recording started later has to be written
++// at the rate the callback is actually fed at.
++static uint32_t g_device_rate_hz = 0;
+ 
+ static void SDLCALL sdl3_audio_callback(void* userdata, SDL_AudioStream* stream,
+                                         int additional_amount,
+@@ -56,15 +59,23 @@ static void SDLCALL sdl3_audio_callback(void* userdata, SDL_AudioStream* stream,
  
  // Starting and stopping the recording while the machine runs, rather than only
  // from the command line. What is dumped here is the mixer's output - the same
 -// thing the sound card is playing, Mockingboard included - which is not quite
 -// what the headless frontend writes, where there is no mixer and the samples
 -// come straight from the speaker.
-+// thing the sound card is playing - which is not quite what the headless
-+// frontend writes, where there is no mixer and the samples come straight from
-+// the speaker. In practice the two carry the same sound: the mixer's other
-+// input is the Mockingboard, which is unfinished and makes none.
++// thing the sound card is playing - taken at the device's rate. The headless
++// frontend records the same mixer, but pulled on emulated time rather than by
++// a device, which is the difference the timing note in the documentation is
++// about.
  auto frontend_audio_dump_start(const char* path) -> bool {
    if (path == nullptr || *path == '\0') {
      return false;
@@ -50,18 +60,12 @@ index 9852ac4..37a20b2 100644
 +    return false;
 +  }
    frontend_audio_dump_stop();
-   if (audio_dumper_initialize(&g_audio_dumper, path, SPKR_SAMPLE_RATE, 2) !=
+-  if (audio_dumper_initialize(&g_audio_dumper, path, SPKR_SAMPLE_RATE, 2) !=
++  if (audio_dumper_initialize(&g_audio_dumper, path, g_device_rate_hz, 2) !=
        0) {
-@@ -89,18 +97,26 @@ auto ds_init() -> bool {
-   desired.channels = 2;
-   desired.format = SDL_AUDIO_S16;
- 
--  if (!g_audio_dump_file.empty()) {
--    audio_dumper_initialize(&g_audio_dumper, g_audio_dump_file.c_str(),
--                            SPKR_SAMPLE_RATE, 2);
--  }
--
-   g_audioStream =
+     return false;
+   }
+@@ -108,22 +119,30 @@ auto ds_init() -> bool {
        SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired,
                                  sdl3_audio_callback, nullptr);
    if (!g_audioStream) {
@@ -75,15 +79,26 @@ index 9852ac4..37a20b2 100644
      return false;
    }
  
+   // SDL3 honours the stream's source spec exactly, so what was asked for is
+   // what the callback is fed.
+-  const auto device_rate_hz = static_cast<uint32_t>(device_rate);
++  g_device_rate_hz = static_cast<uint32_t>(device_rate);
+ 
 +  // Only once the device is open, because that callback is what fills it.
-+  if (!g_audio_dump_file.empty()) {
-+    audio_dumper_initialize(&g_audio_dumper, g_audio_dump_file.c_str(),
-+                            SPKR_SAMPLE_RATE, 2);
-+  }
-+
+   if (!g_audio_dump_file.empty()) {
+     audio_dumper_initialize(&g_audio_dumper, g_audio_dump_file.c_str(),
+-                            device_rate_hz, 2);
++                            g_device_rate_hz, 2);
+   }
+ 
    SDL_ResumeAudioStreamDevice(g_audioStream);
    g_ds_available = true;
  
+-  audio_mixer_initialize(device_rate_hz);
++  audio_mixer_initialize(g_device_rate_hz);
+ 
+   linapple_set_audio_source_register_callback(
+       [](int slot, const char* peripheral_id,
 -- 
 2.53.0
 

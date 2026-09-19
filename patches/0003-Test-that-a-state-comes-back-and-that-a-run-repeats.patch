@@ -1,4 +1,4 @@
-From b22809c8de72f193010318b4f19795b3a501d051 Mon Sep 17 00:00:00 2001
+From 775b1a81abde279c5cf9224e7d080a4bf1106ec1 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Fri, 18 Sep 2026 14:17:47 +0900
 Subject: [PATCH 3/9] Test that a state comes back and that a run repeats
@@ -21,14 +21,14 @@ satisfy it.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 ---
- tests/test_agent_commands.cpp | 114 ++++++++++++++++++++++++++++++++++
- 1 file changed, 114 insertions(+)
+ tests/test_agent_commands.cpp | 116 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 116 insertions(+)
 
 diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
-index 321b681..1fedd48 100644
+index c5a50f4..93fc102 100644
 --- a/tests/test_agent_commands.cpp
 +++ b/tests/test_agent_commands.cpp
-@@ -319,6 +319,36 @@ struct AgentSocketFixture_t {
+@@ -323,6 +323,36 @@ struct AgentSocketFixture_t {
    }
  };
  
@@ -65,14 +65,15 @@ index 321b681..1fedd48 100644
  }  // namespace
  
  // --- malformed input -------------------------------------------------------
-@@ -912,6 +942,90 @@ TEST_CASE("Agent: the input commands check their sizes") {
+@@ -944,6 +974,92 @@ TEST_CASE("Agent: the input commands check their sizes") {
    agent_input_set_capture(false, 0);
  }
  
 +// --- save states and repeating a run ---------------------------------------
 +
 +TEST_CASE("Agent: a save state puts the machine back where it was") {
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  StateFileFixture_t state_file;
 +  select_text_page1();
 +  // A screen that never stops moving is the honest case: if loading a state
@@ -100,7 +101,8 @@ index 321b681..1fedd48 100644
 +}
 +
 +TEST_CASE("Agent: the same state and the same inputs run the same way") {
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  StateFileFixture_t state_file;
 +  select_text_page1();
 +  // The program copies the keyboard latch to the screen, so the run's result

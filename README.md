@@ -42,9 +42,8 @@ connected: {'emulator': 'linapple', 'frontend': 'headless', 'protocol': 1}
 the machine did the arithmetic. everything is wired up.
 ```
 
-Building the patched emulator: [docs/build.md](docs/build.md). The patches
-apply to LinApple at commit `011add9`; upstream has moved on since, so check
-that commit out before `git am`.
+Building the patched emulator: [docs/build.md](docs/build.md). The patches are
+against upstream `master` at `3c00687`.
 
 ## What is here
 

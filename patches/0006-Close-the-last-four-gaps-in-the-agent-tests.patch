@@ -1,4 +1,4 @@
-From 53474393a599033793734320b4d98433cb792cb4 Mon Sep 17 00:00:00 2001
+From 32e8d8ee1c7b50e0f77083685145c8fe68e89bdb Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Fri, 18 Sep 2026 14:44:38 +0900
 Subject: [PATCH 6/9] Close the last four gaps in the agent tests
@@ -31,14 +31,14 @@ id it sent, and one leaving does not disturb the other.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 ---
- tests/test_agent_commands.cpp | 245 ++++++++++++++++++++++++++++++++--
- 1 file changed, 235 insertions(+), 10 deletions(-)
+ tests/test_agent_commands.cpp | 249 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 239 insertions(+), 10 deletions(-)
 
 diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
-index 8f8c447..22a2a07 100644
+index 0bfc53f..160f416 100644
 --- a/tests/test_agent_commands.cpp
 +++ b/tests/test_agent_commands.cpp
-@@ -136,6 +136,39 @@ auto select_text_page1() -> void {
+@@ -140,6 +140,39 @@ auto select_text_page1() -> void {
    touch_switch(0xC051);  // text
  }
  
@@ -78,7 +78,7 @@ index 8f8c447..22a2a07 100644
  auto poke(uint16_t address, uint8_t value) -> void {
    uint8_t* cell = mem_get_main_ptr(address);
    REQUIRE(cell != nullptr);
-@@ -249,20 +282,29 @@ struct AgentSocketFixture_t {
+@@ -253,20 +286,29 @@ struct AgentSocketFixture_t {
      REQUIRE(agent_server_is_active());
    }
  
@@ -114,7 +114,7 @@ index 8f8c447..22a2a07 100644
      REQUIRE(agent_server_client_count() == 1);
    }
  
-@@ -273,11 +315,13 @@ struct AgentSocketFixture_t {
+@@ -277,11 +319,13 @@ struct AgentSocketFixture_t {
      }
    }
  
@@ -131,7 +131,7 @@ index 8f8c447..22a2a07 100644
        if (written > 0) {
          sent += static_cast<size_t>(written);
          continue;
-@@ -295,12 +339,16 @@ struct AgentSocketFixture_t {
+@@ -299,12 +343,16 @@ struct AgentSocketFixture_t {
    // has arrived, or the budget runs out. A bounded loop rather than a blocking
    // read keeps a regression from turning into a hung test run.
    auto collect_replies(size_t count) -> std::vector<std::string> {
@@ -149,14 +149,15 @@ index 8f8c447..22a2a07 100644
        if (got > 0) {
          inbox.append(chunk.data(), static_cast<size_t>(got));
        }
-@@ -942,6 +990,140 @@ TEST_CASE("Agent: the input commands check their sizes") {
+@@ -974,6 +1022,144 @@ TEST_CASE("Agent: the input commands check their sizes") {
    agent_input_set_capture(false, 0);
  }
  
 +// --- what the screen commands hand back ------------------------------------
 +
 +TEST_CASE("Agent: screen_text reads 80 columns out of both banks") {
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  select_text_page1();
 +  touch_switch(0xC00D);  // 80 columns
 +  REQUIRE(video_get_sw_80col());
@@ -187,7 +188,8 @@ index 8f8c447..22a2a07 100644
 +}
 +
 +TEST_CASE("Agent: screen_hires hands back the page byte for byte") {
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +
 +  // A pattern rather than a constant: a decoder that drops or reorders bytes
 +  // passes a run of identical ones.
@@ -224,7 +226,8 @@ index 8f8c447..22a2a07 100644
 +}
 +
 +TEST_CASE("Agent: screen_capture hands back the frame buffer as it stands") {
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  harness.run_frames(2);
 +
 +  const Json result = ok_result("screen_capture");
@@ -255,7 +258,8 @@ index 8f8c447..22a2a07 100644
 +// --- what a run does to the machine's settings ------------------------------
 +
 +TEST_CASE("Agent: a deterministic run gives the turbo setting back") {
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  select_text_page1();
 +  run_program(0x0300, program_idle);
 +
@@ -290,7 +294,7 @@ index 8f8c447..22a2a07 100644
  // --- slot 0 shares one id space ---------------------------------------------
  
  namespace {
-@@ -1234,6 +1416,49 @@ TEST_CASE("Agent server: a request line past the cap drops the client") {
+@@ -1273,6 +1459,49 @@ TEST_CASE("Agent server: a request line past the cap drops the client") {
    CHECK(agent_server_client_count() == 0);
  }
  

@@ -1,4 +1,4 @@
-From 35b7abc098c78b9fdaccd4598d03c467505b43d9 Mon Sep 17 00:00:00 2001
+From 8dee5e12fb3daa4b8852cd6d3b7660cc0f05649c Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 01:48:39 +0900
 Subject: [PATCH 9/9] Read the screen off a real program, and say what a run
@@ -43,11 +43,11 @@ to disagree with.
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 ---
  src/frontends/common/agent/AgentCommands.cpp |  68 ++++-
- tests/test_agent_commands.cpp                | 245 +++++++++++++++++++
- 2 files changed, 306 insertions(+), 7 deletions(-)
+ tests/test_agent_commands.cpp                | 250 +++++++++++++++++++
+ 2 files changed, 311 insertions(+), 7 deletions(-)
 
 diff --git a/src/frontends/common/agent/AgentCommands.cpp b/src/frontends/common/agent/AgentCommands.cpp
-index a5b5473..72ef755 100644
+index 2c60787..6358cbd 100644
 --- a/src/frontends/common/agent/AgentCommands.cpp
 +++ b/src/frontends/common/agent/AgentCommands.cpp
 @@ -205,10 +205,25 @@ auto memory_view_of(const Json& params, std::string* view) -> bool {
@@ -179,7 +179,7 @@ index a5b5473..72ef755 100644
    }
  
 diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
-index c182dcc..0fde953 100644
+index 4d31447..3d6961f 100644
 --- a/tests/test_agent_commands.cpp
 +++ b/tests/test_agent_commands.cpp
 @@ -17,6 +17,9 @@
@@ -192,7 +192,7 @@ index c182dcc..0fde953 100644
  #include <string>
  #include <vector>
  
-@@ -1328,6 +1331,93 @@ TEST_CASE("Agent: screen_text reads 80 columns out of both banks") {
+@@ -1366,6 +1369,95 @@ TEST_CASE("Agent: screen_text reads 80 columns out of both banks") {
    CHECK(narrow.at("lines").at(0).get<std::string>().substr(0, 5) == "12345");
  }
  
@@ -228,7 +228,8 @@ index c182dcc..0fde953 100644
 +  // own font into hi-res and never touches the text page, so the command has
 +  // never been read off a program that was actually printing. Applesoft is in
 +  // ROM and prints in exactly the way the command claims to read.
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  auto disk = TestFixtures::create_ephemeral("minimal.dsk");
 +  harness.mount_disk(6, 0, disk);
 +  harness.boot();
@@ -263,7 +264,8 @@ index c182dcc..0fde953 100644
 +  // odd ones out of main, and until now it had only ever been shown the bytes
 +  // this file poked into those banks. PR#3 hands the screen to the //e's own
 +  // 80-column firmware, which puts them there itself.
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  auto disk = TestFixtures::create_ephemeral("minimal.dsk");
 +  harness.mount_disk(6, 0, disk);
 +  harness.boot();
@@ -284,9 +286,9 @@ index c182dcc..0fde953 100644
 +}
 +
  TEST_CASE("Agent: screen_hires hands back the page byte for byte") {
-   HeadlessHarness_t harness;
- 
-@@ -1429,6 +1519,76 @@ TEST_CASE("Agent: a deterministic run gives the turbo setting back") {
+   TestConfig_t test_config(TestConfig_t::disk_ii_only());
+   HeadlessHarness_t harness(test_config);
+@@ -1470,6 +1562,78 @@ TEST_CASE("Agent: a deterministic run gives the turbo setting back") {
    ok_result("turbo_set", {{"turbo", false}});
  }
  
@@ -295,7 +297,8 @@ index c182dcc..0fde953 100644
 +  // workspace but the TAS recorder passes deterministic=false, so what the
 +  // path they use actually promises had never been written down. It is this:
 +  // not much, and a hundred times not much.
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  select_text_page1();
 +  run_program(0x0300, program_idle);
 +
@@ -330,7 +333,8 @@ index c182dcc..0fde953 100644
 +}
 +
 +TEST_CASE("Agent: a wait runs flat out unless it is told not to") {
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  select_text_page1();
 +  run_program(0x0300, program_idle);
 +  ok_result("turbo_set", {{"turbo", true}});
@@ -363,7 +367,7 @@ index c182dcc..0fde953 100644
  // --- slot 0 shares one id space ---------------------------------------------
  
  namespace {
-@@ -1651,6 +1811,91 @@ TEST_CASE("Agent: the same state and the same inputs run the same way") {
+@@ -1699,6 +1863,92 @@ TEST_CASE("Agent: the same state and the same inputs run the same way") {
    CHECK(*mem_get_main_ptr(0x0400) != first.cell);
  }
  
@@ -387,7 +391,8 @@ index c182dcc..0fde953 100644
 +}  // namespace
 +
 +TEST_CASE("Agent: a state rewinds the machine and not the disk in the drive") {
-+  HeadlessHarness_t harness;
++  TestConfig_t test_config(TestConfig_t::disk_ii_only());
++  HeadlessHarness_t harness(test_config);
 +  StateFileFixture_t state_file;
 +  auto disk = TestFixtures::create_ephemeral("minimal.dsk");
 +  harness.mount_disk(6, 0, disk);
