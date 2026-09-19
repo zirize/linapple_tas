@@ -54,7 +54,8 @@ patches/     nine commits against LinApple: the socket, its tests, and the
 clients/     the Python client (standard library only, >= 3.10)
 tools/       twelve tools that use it
 docs/        nine short documents, one question each
-examples/    a script, a profile and a TAS plan that all run without a game
+examples/    a script, a profile and a TAS plan that all run without a game,
+             and bards-tale/ — one real game worked through end to end
 dev/         check-public.sh (safe to publish?) and smoke.sh (does it work?)
 ```
 

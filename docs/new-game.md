@@ -49,6 +49,15 @@ nothing to stand on. TAS and memory work on both.
    right size to be a map, `match`/`cells` score a candidate map against walls
    you actually walked into.
 
+## What it looks like finished
+
+[examples/bards-tale/](../examples/bards-tale/) carries this order through
+on The Bard's Tale: the three zero-page bytes that hold the party's
+position, the map at `$F800`, how its encoding was settled against 576
+candidates by walking 45 sides, and the game-specific walker that answers
+everything the game interrupts a survey with. No game data — the code and
+the method.
+
 ## Things that cost other people days
 
 - **The key that opens a thing is often not the movement key.** In one game
