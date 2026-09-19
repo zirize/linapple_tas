@@ -1,0 +1,281 @@
+From 1eed1e522f7305b48fe348bde1d56a3166bca1d1 Mon Sep 17 00:00:00 2001
+From: zirize <zirize@gmail.com>
+Date: Fri, 18 Sep 2026 14:37:06 +0900
+Subject: [PATCH 5/9] Let a caller name the peripheral it means
+
+Slot 0 is the only slot that holds more than one peripheral - the keyboard,
+the joystick and the speaker all live there, while slots 1 to 7 take exactly
+one - and their command ids overlap. Payload size now keeps the commands
+apart, but it cannot separate a query whose answer is the same width:
+keyboard_query_rocker and JOY_QUERY_EXIT_EVENT are both id 2 and both answer
+one byte, so a broadcast lands on whichever peripheral the slot happens to
+hold first, which is static initialisation order.
+
+peripheral_command_to() and peripheral_query_to() name the peripheral, by its
+namespaced id or its human name, the way peripheral_save_state_by_name()
+already does for state. Nothing is renumbered and Peripheral_t is untouched,
+so a peripheral built against the current ABI still works; the broadcast calls
+stay for everything an id uniquely identifies.
+
+The rocker query is the one caller that needed it, in all four frontends and
+in the video refresh. The joystick's exit event is left where it is with a
+note: nothing sets the flag it reports and nothing asks for it, and removing a
+published enum value would break a source build for no gain.
+
+Not built here: the SDL1 frontend, which needs a dev package this machine does
+not have. Its change is the same one line as SDL2 and SDL3, which do build.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/apple2/Video.cpp                          |  4 +-
+ .../peripherals/joystick/JoystickCommands.h   |  4 ++
+ src/core/Peripheral.cpp                       | 47 ++++++++++++++++
+ src/core/Peripheral.h                         | 10 ++++
+ src/frontends/sdl1/Frame.cpp                  |  3 +-
+ src/frontends/sdl2/Frame.cpp                  |  3 +-
+ src/frontends/sdl3/Frame.cpp                  |  3 +-
+ src/frontends/tui/TuiInput.cpp                |  3 +-
+ tests/test_agent_commands.cpp                 | 55 +++++++++++++++++--
+ 9 files changed, 121 insertions(+), 11 deletions(-)
+
+diff --git a/src/apple2/Video.cpp b/src/apple2/Video.cpp
+index faf3982..f243e8a 100644
+--- a/src/apple2/Video.cpp
++++ b/src/apple2/Video.cpp
+@@ -1704,8 +1704,8 @@ auto video_perform_refresh() -> void {
+ 
+   uint8_t rocker = 0;
+   size_t rocker_sz = sizeof(rocker);
+-  if (peripheral_query(0, keyboard_query_rocker, &rocker, &rocker_sz) ==
+-      peripheral_ok) {
++  if (peripheral_query_to(0, "linapple.keyboard", keyboard_query_rocker,
++                          &rocker, &rocker_sz) == peripheral_ok) {
+     s_language_rocker_switch = (rocker != 0);
+   }
+ 
+diff --git a/src/apple2/peripherals/joystick/JoystickCommands.h b/src/apple2/peripherals/joystick/JoystickCommands.h
+index c9d29fa..4839f43 100644
+--- a/src/apple2/peripherals/joystick/JoystickCommands.h
++++ b/src/apple2/peripherals/joystick/JoystickCommands.h
+@@ -25,6 +25,10 @@ typedef enum {
+ 
+ typedef enum {
+   JOY_QUERY_CONFIG = 0x0001,
++  /* Not wired up: nothing sets the flag this reports and nothing asks for it.
++   * It also shares id 2 with keyboard_query_rocker, whose answer is a byte as
++   * well, so a broadcast query cannot tell the two apart - reach either one
++   * with peripheral_query_to(). Kept because the id is published ABI. */
+   JOY_QUERY_EXIT_EVENT = 0x0002
+ } JoystickQuery_e;
+ 
+diff --git a/src/core/Peripheral.cpp b/src/core/Peripheral.cpp
+index f1919e8..2e3873e 100644
+--- a/src/core/Peripheral.cpp
++++ b/src/core/Peripheral.cpp
+@@ -632,6 +632,53 @@ auto peripheral_command(int slot, uint32_t cmd_id, const void* data,
+   return peripheral_ok;
+ }
+ 
++// Matches on either the namespaced id or the human name, the way the plugin
++// lookup does, so a caller can use whichever it has to hand.
++static auto peripheral_named(int slot, const char* who) -> ActivePeripheral_t* {
++  if (slot < 0 || slot >= static_cast<int>(NUM_SLOTS) || who == nullptr) {
++    return nullptr;
++  }
++  for (auto& ap : g_active_peripherals.at(static_cast<size_t>(slot))) {
++    if (ap.api == nullptr) {
++      continue;
++    }
++    if ((ap.api->id != nullptr && strcmp(ap.api->id, who) == 0) ||
++        (ap.api->name != nullptr && strcmp(ap.api->name, who) == 0)) {
++      return &ap;
++    }
++  }
++  return nullptr;
++}
++
++auto peripheral_command_to(int slot, const char* who, uint32_t cmd_id,
++                           const void* data, size_t size)
++    -> PeripheralStatus_t {
++  if (size > PERIPHERAL_CMD_MAX_DATA) {
++    return peripheral_error;
++  }
++  ActivePeripheral_t* ap = peripheral_named(slot, who);
++  if (ap == nullptr || ap->api->command == nullptr) {
++    return peripheral_error;
++  }
++  // Straight through rather than onto the queue: the queue exists so that a
++  // command sent from another thread lands on an emulation boundary, and it
++  // carries no room for a name. Callers that need that ordering keep using
++  // peripheral_command.
++  return ap->api->command(ap->instance, cmd_id, data, size);
++}
++
++auto peripheral_query_to(int slot, const char* who, uint32_t cmd_id, void* out,
++                         size_t* out_size) -> PeripheralStatus_t {
++  if (out_size == nullptr) {
++    return peripheral_error;
++  }
++  ActivePeripheral_t* ap = peripheral_named(slot, who);
++  if (ap == nullptr || ap->api->query == nullptr) {
++    return peripheral_error;
++  }
++  return ap->api->query(ap->instance, cmd_id, out, out_size);
++}
++
+ auto peripheral_query(int slot, uint32_t cmd_id, void* out, size_t* out_size)
+     -> PeripheralStatus_t {
+   if (slot < 0 || slot >= static_cast<int>(NUM_SLOTS) || out == nullptr ||
+diff --git a/src/core/Peripheral.h b/src/core/Peripheral.h
+index fccafd0..9ec8bf5 100644
+--- a/src/core/Peripheral.h
++++ b/src/core/Peripheral.h
+@@ -120,6 +120,16 @@ PeripheralStatus_t peripheral_command(int slot, uint32_t cmd_id,
+                                       const void* data, size_t size);
+ PeripheralStatus_t peripheral_query(int slot, uint32_t cmd_id, void* out,
+                                     size_t* out_size);
++/* Slot 0 holds several peripherals and their command ids overlap, so a
++ * broadcast is only safe while the payload sizes happen to differ. These name
++ * the peripheral instead - by its id ("linapple.keyboard") or its name - and
++ * are the way to reach an id that another peripheral in the slot also uses. */
++PeripheralStatus_t peripheral_command_to(int slot, const char* who,
++                                         uint32_t cmd_id, const void* data,
++                                         size_t size);
++PeripheralStatus_t peripheral_query_to(int slot, const char* who,
++                                       uint32_t cmd_id, void* out,
++                                       size_t* out_size);
+ void peripheral_save_state(int slot, void* buffer, size_t* size);
+ void peripheral_load_state(int slot, const void* buffer, size_t size);
+ void peripheral_save_state_by_name(int slot, const char* name, void* buffer,
+diff --git a/src/frontends/sdl1/Frame.cpp b/src/frontends/sdl1/Frame.cpp
+index 8245de3..2a9aa70 100644
+--- a/src/frontends/sdl1/Frame.cpp
++++ b/src/frontends/sdl1/Frame.cpp
+@@ -698,7 +698,8 @@ void process_button_click(int button, int mod) {
+              (g_apple2_type == A2TYPE_APPLE2EENHANCED))) {
+           uint8_t cur_rocker = 0;
+           size_t rocker_sz = sizeof(cur_rocker);
+-          peripheral_query(0, keyboard_query_rocker, &cur_rocker, &rocker_sz);
++          peripheral_query_to(0, "linapple.keyboard", keyboard_query_rocker,
++                              &cur_rocker, &rocker_sz);
+           uint8_t new_rocker = (cur_rocker != 0) ? 0 : 1;
+           peripheral_command(0, keyboard_cmd_set_rocker, &new_rocker, 1);
+           printf(
+diff --git a/src/frontends/sdl2/Frame.cpp b/src/frontends/sdl2/Frame.cpp
+index edcddc1..79184ea 100644
+--- a/src/frontends/sdl2/Frame.cpp
++++ b/src/frontends/sdl2/Frame.cpp
+@@ -712,7 +712,8 @@ void process_button_click(int button, int mod) {
+              (g_apple2_type == A2TYPE_APPLE2EENHANCED))) {
+           uint8_t cur_rocker = 0;
+           size_t rocker_sz = sizeof(cur_rocker);
+-          peripheral_query(0, keyboard_query_rocker, &cur_rocker, &rocker_sz);
++          peripheral_query_to(0, "linapple.keyboard", keyboard_query_rocker,
++                              &cur_rocker, &rocker_sz);
+           uint8_t new_rocker = (cur_rocker != 0) ? 0 : 1;
+           peripheral_command(0, keyboard_cmd_set_rocker, &new_rocker, 1);
+           printf(
+diff --git a/src/frontends/sdl3/Frame.cpp b/src/frontends/sdl3/Frame.cpp
+index b6bd2d2..fa3a12d 100644
+--- a/src/frontends/sdl3/Frame.cpp
++++ b/src/frontends/sdl3/Frame.cpp
+@@ -734,7 +734,8 @@ void process_button_click(int button, int mod) {
+              (g_apple2_type == A2TYPE_APPLE2EENHANCED))) {
+           uint8_t cur_rocker = 0;
+           size_t rocker_sz = sizeof(cur_rocker);
+-          peripheral_query(0, keyboard_query_rocker, &cur_rocker, &rocker_sz);
++          peripheral_query_to(0, "linapple.keyboard", keyboard_query_rocker,
++                              &cur_rocker, &rocker_sz);
+           uint8_t new_rocker = cur_rocker ? 0 : 1;
+           peripheral_command(0, keyboard_cmd_set_rocker, &new_rocker, 1);
+           printf(
+diff --git a/src/frontends/tui/TuiInput.cpp b/src/frontends/tui/TuiInput.cpp
+index 210c0fb..3e7704c 100644
+--- a/src/frontends/tui/TuiInput.cpp
++++ b/src/frontends/tui/TuiInput.cpp
+@@ -104,7 +104,8 @@ static auto toggle_keyboard_rocker() -> void {
+       (g_apple2_type == A2TYPE_APPLE2EENHANCED)) {
+     uint8_t cur_rocker = 0;
+     size_t rocker_sz = sizeof(cur_rocker);
+-    peripheral_query(0, keyboard_query_rocker, &cur_rocker, &rocker_sz);
++    peripheral_query_to(0, "linapple.keyboard", keyboard_query_rocker,
++                        &cur_rocker, &rocker_sz);
+     uint8_t new_rocker = (cur_rocker != 0) ? 0 : 1;
+     peripheral_command(0, keyboard_cmd_set_rocker, &new_rocker, 1);
+   }
+diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
+index d84b992..8f8c447 100644
+--- a/tests/test_agent_commands.cpp
++++ b/tests/test_agent_commands.cpp
+@@ -1035,6 +1035,51 @@ TEST_CASE("Slot 0: a query is answered by the peripheral that owns the id") {
+   CHECK(mods_size == sizeof(KeyboardModifiers_t));
+ }
+ 
++TEST_CASE("Slot 0: naming the peripheral reaches it past an id it shares") {
++  HeadlessHarness_t harness;
++
++  // keyboard_query_rocker and JOY_QUERY_EXIT_EVENT are both id 2 and both
++  // answer a single byte, so size cannot separate them and a broadcast lands
++  // on whichever peripheral the slot holds first. Naming the peripheral is the
++  // only way to be sure which one answered.
++  const uint8_t rocker_on = 1;
++  REQUIRE(peripheral_command_to(0, "linapple.keyboard", keyboard_cmd_set_rocker,
++                                &rocker_on,
++                                sizeof(rocker_on)) == peripheral_ok);
++
++  uint8_t rocker = 0;
++  size_t rocker_size = sizeof(rocker);
++  REQUIRE(peripheral_query_to(0, "linapple.keyboard", keyboard_query_rocker,
++                              &rocker, &rocker_size) == peripheral_ok);
++  CHECK(rocker == 1);
++
++  // The joystick's answer under the same id is its own, and it is the one that
++  // has never been wired up - what matters is that it is not the keyboard's.
++  uint8_t exit_event = 1;
++  size_t exit_size = sizeof(exit_event);
++  REQUIRE(peripheral_query_to(0, "linapple.joystick", JOY_QUERY_EXIT_EVENT,
++                              &exit_event, &exit_size) == peripheral_ok);
++  CHECK(exit_event == 0);
++
++  // The human name works as well as the id, and a peripheral that is not in
++  // the slot is an error rather than someone else's answer.
++  rocker = 0;
++  rocker_size = sizeof(rocker);
++  CHECK(peripheral_query_to(0, "Keyboard", keyboard_query_rocker, &rocker,
++                            &rocker_size) == peripheral_ok);
++  CHECK(rocker == 1);
++  CHECK(peripheral_query_to(0, "linapple.disk_II", keyboard_query_rocker,
++                            &rocker, &rocker_size) == peripheral_error);
++  CHECK(peripheral_command_to(0, "linapple.disk_II", keyboard_cmd_set_rocker,
++                              &rocker_on,
++                              sizeof(rocker_on)) == peripheral_error);
++
++  const uint8_t rocker_off = 0;
++  REQUIRE(peripheral_command_to(0, "linapple.keyboard", keyboard_cmd_set_rocker,
++                                &rocker_off,
++                                sizeof(rocker_off)) == peripheral_ok);
++}
++
+ // --- save states and repeating a run ---------------------------------------
+ 
+ TEST_CASE("Agent: a save state puts the machine back where it was") {
+@@ -1090,11 +1135,11 @@ TEST_CASE("Agent: the same state and the same inputs run the same way") {
+     Run_t run;
+     for (size_t i = 0; i < script.size(); ++i) {
+       ok_result("key_state", {{"key", script.at(i).first}, {"down", true}});
+-      run.cycles.push_back(ok_result("run_frames",
+-                                     {{"frames", script.at(i).second},
+-                                      {"deterministic", true}})
+-                               .at("cycles")
+-                               .get<uint64_t>());
++      run.cycles.push_back(
++          ok_result("run_frames",
++                    {{"frames", script.at(i).second}, {"deterministic", true}})
++              .at("cycles")
++              .get<uint64_t>());
+     }
+     run.hash = screen_hash();
+     run.cell = *mem_get_main_ptr(0x0400);
+-- 
+2.53.0
+

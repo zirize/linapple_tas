@@ -1,0 +1,460 @@
+From 35b7abc098c78b9fdaccd4598d03c467505b43d9 Mon Sep 17 00:00:00 2001
+From: zirize <zirize@gmail.com>
+Date: Sat, 19 Sep 2026 01:48:39 +0900
+Subject: [PATCH 9/9] Read the screen off a real program, and say what a run
+ and a state promise
+
+Three of the gaps left were not bugs but blanks: things the suite had only
+ever shown itself.
+
+screen_text had never been read off a program that was printing. Bard's Tale
+paints its own font into hi-res and never touches the text page, so every case
+wrote the screen codes by hand, which proves the addressing and nothing else.
+Applesoft is in ROM: boot, E000G, PRINT, and compare - the printed line has to
+turn up, and every row has to match the harness's own decoder, which reads the
+same cells by a different route. PR#3 hands the screen to the //e's 80-column
+firmware, which is the first time the interleaved aux/main read has been shown
+anything but bytes this file poked into those banks. Take the aux half of that
+read out and the case fails.
+
+run_frames' deterministic flag was tested while every tool in the workspace
+but tas.py passes false, so what the path they use promises was never written
+down. It is this: a frame is a frame only when the run was asked to be exact.
+Turbo, and the full-speed path the core takes by itself whenever a drive is
+spinning, both run a frame's cycles a hundred times over - three frames cost
+51,093 cycles exact and 5,109,300 not. So a wait of sixty frames can pass six
+thousand frames of game time and walk past the screen it was waiting for. Both
+commands now say which they were, and run_until_change takes the flag instead
+of being wired to false - defaulting the other way, because what a wait is
+waiting for is usually a disk load.
+
+And a save state rewinds the machine, not the disk in the drive. A game's
+write goes through to the image on the host, so a load afterwards leaves the
+file written while the machine goes back to believing what it saw before, and
+nothing about the machine says otherwise. That destroyed a character disk in
+this workspace once. Nothing here can fix it - a state carrying disk images is
+a different feature - but state_save and state_load now list the drives the
+rewind will not reach, so a client can refuse the combination, warn, or insert
+the disk write-protected, which empties the list because then there is nothing
+to disagree with.
+
+56 cases.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/frontends/common/agent/AgentCommands.cpp |  68 ++++-
+ tests/test_agent_commands.cpp                | 245 +++++++++++++++++++
+ 2 files changed, 306 insertions(+), 7 deletions(-)
+
+diff --git a/src/frontends/common/agent/AgentCommands.cpp b/src/frontends/common/agent/AgentCommands.cpp
+index a5b5473..72ef755 100644
+--- a/src/frontends/common/agent/AgentCommands.cpp
++++ b/src/frontends/common/agent/AgentCommands.cpp
+@@ -205,10 +205,25 @@ auto memory_view_of(const Json& params, std::string* view) -> bool {
+ 
+ // --- run control -----------------------------------------------------------
+ 
+-// Runs exactly `frames` emulated frames and parks the machine again. Turbo and
+-// the disk-driven full-speed path both multiply the cycles a single
+-// linapple_run_frame() call consumes, so deterministic stepping disables them
+-// for the duration and restores the caller's settings afterwards.
++// Runs `frames` emulated frames and parks the machine again.
++//
++// What a frame costs is not fixed. Turbo, and the full-speed path the core
++// takes by itself whenever a drive is spinning, both make one
++// linapple_run_frame() call run the frame's cycles a hundred times over. So
++// `deterministic` is not a tuning knob, it decides what the word "frame"
++// means in the request:
++//
++//   deterministic: one frame is one frame's cycles, every time. The run is
++//     reproducible and a frame count is a length of time -- which is what a
++//     recorded input has to be replayed against. A disk load is emulated at
++//     the speed an Apple II loaded disks.
++//
++//   not deterministic: a frame is up to a hundred frames while a drive is
++//     spinning or the host asked for turbo. Sitting through a boot takes a
++//     hundredth of the wall clock, and the frame count stops being a time.
++//
++// Either way the caller's turbo setting is put back: it belongs to the person
++// at the window, not to the command.
+ auto step_frames(uint32_t frames, bool deterministic) -> uint64_t {
+   const AppMode_t saved_mode = g_state.mode;
+   const bool saved_turbo = linapple_get_turbo();
+@@ -432,6 +447,34 @@ auto disk_status_json() -> Json {
+   return result;
+ }
+ 
++// What a save state does not carry.
++//
++// A state is the machine: memory, registers, where each drive's head is and
++// which image is in it. It is not the image. A program that writes to a disk
++// writes through to the file on the host, and loading a state afterwards winds
++// the machine back to before that write while the file stays written - the
++// machine goes on believing it is reading the disk it saw at save time, and
++// the two drift apart silently. That is how a character disk in this workspace
++// was destroyed once already.
++//
++// Nothing here can fix that; a state that carried whole disk images would be a
++// different feature with a different cost. What it can do is stop the mismatch
++// being invisible: every state command says which drives hold an image that
++// the rewind will not touch, so a client can refuse the combination, warn
++// about it, or write-protect the drive first.
++auto add_disk_rewind_warning(Json* result) -> void {
++  const Json drives = disk_status_json().at("drives");
++  Json at_risk = Json::array();
++  for (const Json& drive : drives) {
++    if (drive.at("loaded").get<bool>() &&
++        !drive.at("write_protected").get<bool>()) {
++      at_risk.push_back(drive.at("drive"));
++    }
++  }
++  (*result)["disks"] = drives;
++  (*result)["disks_not_rewound"] = at_risk;
++}
++
+ // --- command table ---------------------------------------------------------
+ 
+ const std::array<const char*, 24> command_names = {
+@@ -573,12 +616,13 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+     if (frames < 0 || static_cast<uint64_t>(frames) > max_step_frames) {
+       return make_error(request, "frames out of range");
+     }
++    const bool deterministic = param_bool(params, "deterministic", true);
+     const uint64_t executed =
+-        step_frames(static_cast<uint32_t>(frames),
+-                    param_bool(params, "deterministic", true));
++        step_frames(static_cast<uint32_t>(frames), deterministic);
+     Json result;
+     result["frames"] = frames;
+     result["cycles"] = executed;
++    result["deterministic"] = deterministic;
+     result["mode"] = mode_name(g_state.mode);
+     return make_ok(request, result);
+   }
+@@ -786,6 +830,13 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+       return make_error(request, "max_frames or chunk out of range");
+     }
+ 
++    // A wait is the one place where running flat out is usually what the
++    // caller wants: most of what is being waited for is a disk load. So this
++    // defaults the other way from run_frames, and says which it did - under
++    // full speed `frames` counts chunks rather than time, and a caller that
++    // needs the budget to mean something has to ask for it.
++    const bool deterministic = param_bool(params, "deterministic", false);
++
+     const uint64_t started_as = screen_page_hash();
+     uint64_t previous = started_as;
+     uint64_t executed = 0;
+@@ -808,7 +859,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+ 
+     while (spent < max_frames) {
+       const auto chunk_started = std::chrono::steady_clock::now();
+-      executed += step_frames(static_cast<uint32_t>(chunk), false);
++      executed += step_frames(static_cast<uint32_t>(chunk), deterministic);
+       spent += chunk;
+       if (duty_percent < 100) {
+         const auto worked = std::chrono::steady_clock::now() - chunk_started;
+@@ -839,6 +890,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+     result["cycles"] = executed;
+     result["changed"] = changed;
+     result["hash"] = previous;
++    result["deterministic"] = deterministic;
+     result["mode"] = mode_name(g_state.mode);
+     return make_ok(request, result);
+   }
+@@ -954,6 +1006,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+     save_state_save();
+     Json result;
+     result["path"] = std::string(save_state_get_filename());
++    add_disk_rewind_warning(&result);
+     return make_ok(request, result);
+   }
+ 
+@@ -965,6 +1018,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+     save_state_load();
+     Json result;
+     result["path"] = std::string(save_state_get_filename());
++    add_disk_rewind_warning(&result);
+     return make_ok(request, result);
+   }
+ 
+diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
+index c182dcc..0fde953 100644
+--- a/tests/test_agent_commands.cpp
++++ b/tests/test_agent_commands.cpp
+@@ -17,6 +17,9 @@
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
++#include <fstream>
++#include <ios>
++#include <iterator>
+ #include <string>
+ #include <vector>
+ 
+@@ -1328,6 +1331,93 @@ TEST_CASE("Agent: screen_text reads 80 columns out of both banks") {
+   CHECK(narrow.at("lines").at(0).get<std::string>().substr(0, 5) == "12345");
+ }
+ 
++// --- the text screen, read off a real program -------------------------------
++
++namespace {
++
++// The agent's own reading of the screen, one row, with the trailing blanks
++// taken off the way the harness does so the two can be compared.
++auto agent_text_row(const Json& screen, int row) -> std::string {
++  std::string line = screen.at("lines").at(static_cast<size_t>(row))
++                         .get<std::string>();
++  while (!line.empty() && line.back() == ' ') {
++    line.pop_back();
++  }
++  return line;
++}
++
++auto agent_screen_holds(const Json& screen, const std::string& text) -> bool {
++  for (const Json& line : screen.at("lines")) {
++    if (line.get<std::string>().find(text) != std::string::npos) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
++TEST_CASE("Agent: screen_text reads what a real program printed") {
++  // Every other screen_text case writes the screen codes itself, which proves
++  // the addressing and nothing else: the game this workspace drives paints its
++  // own font into hi-res and never touches the text page, so the command has
++  // never been read off a program that was actually printing. Applesoft is in
++  // ROM and prints in exactly the way the command claims to read.
++  HeadlessHarness_t harness;
++  auto disk = TestFixtures::create_ephemeral("minimal.dsk");
++  harness.mount_disk(6, 0, disk);
++  harness.boot();
++  harness.run_frames(20);
++
++  harness.type_string("E000G\r", 4);  // into Applesoft from the monitor
++  harness.run_frames(20);
++  harness.type_string("HOME\r", 4);
++  harness.run_frames(20);
++
++  const std::string printed = "AGENT READS THIS";
++  harness.type_string("PRINT \"" + printed + "\"\r", 4);
++  harness.run_frames(20);
++
++  const Json screen = ok_result("screen_text");
++  CHECK(screen.at("columns").get<int>() == 40);
++  CHECK(screen.at("rows").get<int>() == 24);
++  CHECK(screen.at("text_mode").get<bool>() == true);
++  CHECK(screen.at("mixed").get<bool>() == false);
++  CHECK(agent_screen_holds(screen, printed));
++
++  // And row for row against the harness's own decoder, which reads the same
++  // cells by a different route. Two readings of one screen agreeing is worth
++  // more than either matching a constant this file chose.
++  for (int row = 0; row < 24; ++row) {
++    CHECK(agent_text_row(screen, row) == harness.get_text_row(row));
++  }
++}
++
++TEST_CASE("Agent: screen_text reads 80 columns off the firmware") {
++  // The 80-column case takes the even columns out of auxiliary memory and the
++  // odd ones out of main, and until now it had only ever been shown the bytes
++  // this file poked into those banks. PR#3 hands the screen to the //e's own
++  // 80-column firmware, which puts them there itself.
++  HeadlessHarness_t harness;
++  auto disk = TestFixtures::create_ephemeral("minimal.dsk");
++  harness.mount_disk(6, 0, disk);
++  harness.boot();
++  harness.run_frames(20);
++
++  harness.type_string("E000G\r", 4);
++  harness.run_frames(20);
++  harness.type_string("PR#3\r", 4);
++  harness.run_frames(60);
++
++  const std::string printed = "EIGHTY COLUMNS";
++  harness.type_string("PRINT \"" + printed + "\"\r", 4);
++  harness.run_frames(30);
++
++  const Json screen = ok_result("screen_text");
++  CHECK(screen.at("columns").get<int>() == 80);
++  CHECK(agent_screen_holds(screen, printed));
++}
++
+ TEST_CASE("Agent: screen_hires hands back the page byte for byte") {
+   HeadlessHarness_t harness;
+ 
+@@ -1429,6 +1519,76 @@ TEST_CASE("Agent: a deterministic run gives the turbo setting back") {
+   ok_result("turbo_set", {{"turbo", false}});
+ }
+ 
++TEST_CASE("Agent: a frame is a length of time only if the run was asked to be") {
++  // The suite has always tested the deterministic path while every tool in the
++  // workspace but the TAS recorder passes deterministic=false, so what the
++  // path they use actually promises had never been written down. It is this:
++  // not much, and a hundred times not much.
++  HeadlessHarness_t harness;
++  select_text_page1();
++  run_program(0x0300, program_idle);
++
++  auto run = [](bool deterministic) -> uint64_t {
++    const Json result = ok_result(
++        "run_frames", {{"frames", 3}, {"deterministic", deterministic}});
++    // Which one it was is in the reply, so a caller counting frames as time
++    // can tell whether it got any.
++    CHECK(result.at("deterministic").get<bool>() == deterministic);
++    return result.at("cycles").get<uint64_t>();
++  };
++
++  ok_result("turbo_set", {{"turbo", false}});
++  const uint64_t exact = run(true);
++  REQUIRE(exact > 0);
++  // With nothing running fast there is nothing between them.
++  CHECK(run(false) == exact);
++
++  ok_result("turbo_set", {{"turbo", true}});
++  CHECK(run(true) == exact);
++
++  // And here is the difference the tools have been living with: the same three
++  // frames, asked for the same way, emulate a hundred times as much of the
++  // machine's life. Which is the point when what is being sat through is a
++  // disk load, and a trap when a frame count was meant as a duration - a wait
++  // of "sixty frames" for a game to redraw can pass six thousand frames of
++  // game time and walk straight past the screen it was waiting for.
++  const uint64_t hurried = run(false);
++  CHECK(hurried == exact * 100);
++
++  ok_result("turbo_set", {{"turbo", false}});
++}
++
++TEST_CASE("Agent: a wait runs flat out unless it is told not to") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++  run_program(0x0300, program_idle);
++  ok_result("turbo_set", {{"turbo", true}});
++
++  // A wait defaults the other way from run_frames, because most of what is
++  // waited for is a disk load. The reply says so either way.
++  const Json hurried = ok_result("run_until_change", wait_params(48, 24));
++  CHECK(hurried.at("deterministic").get<bool>() == false);
++
++  Json exact_params = wait_params(48, 24);
++  exact_params["deterministic"] = true;
++  const Json exact = ok_result("run_until_change", exact_params);
++  CHECK(exact.at("deterministic").get<bool>() == true);
++
++  // Asked to be exact, a wait spends its budget in frames - the same cycles
++  // the same number of run_frames would have cost. Left alone under turbo it
++  // spends a hundred times that, which is why `max_frames` is a ceiling on
++  // round trips rather than on emulated time.
++  const uint64_t by_frames =
++      ok_result("run_frames", {{"frames", 48}, {"deterministic", true}})
++          .at("cycles")
++          .get<uint64_t>();
++  CHECK(exact.at("cycles").get<uint64_t>() == by_frames);
++  CHECK(hurried.at("cycles").get<uint64_t>() == by_frames * 100);
++
++  ok_result("turbo_set", {{"turbo", false}});
++  CHECK(ok_result("status").at("turbo").get<bool>() == false);
++}
++
+ // --- slot 0 shares one id space ---------------------------------------------
+ 
+ namespace {
+@@ -1651,6 +1811,91 @@ TEST_CASE("Agent: the same state and the same inputs run the same way") {
+   CHECK(*mem_get_main_ptr(0x0400) != first.cell);
+ }
+ 
++namespace {
++
++auto read_whole_file(const std::string& path) -> std::vector<uint8_t> {
++  std::ifstream file(path, std::ios::binary);
++  REQUIRE(file.good());
++  return std::vector<uint8_t>(std::istreambuf_iterator<char>(file),
++                              std::istreambuf_iterator<char>());
++}
++
++auto write_whole_file(const std::string& path, const std::vector<uint8_t>& data)
++    -> void {
++  std::ofstream file(path, std::ios::binary | std::ios::trunc);
++  REQUIRE(file.good());
++  file.write(reinterpret_cast<const char*>(data.data()),
++             static_cast<std::streamsize>(data.size()));
++}
++
++}  // namespace
++
++TEST_CASE("Agent: a state rewinds the machine and not the disk in the drive") {
++  HeadlessHarness_t harness;
++  StateFileFixture_t state_file;
++  auto disk = TestFixtures::create_ephemeral("minimal.dsk");
++  harness.mount_disk(6, 0, disk);
++  select_text_page1();
++  run_program(0x0300, program_draw_forever);
++
++  const Json saved = ok_result("state_save", {{"path", state_file.path}});
++  ok_result("run_frames", {{"frames", 8}});
++  const uint64_t moved_on = screen_hash();
++
++  // What a write by the running program reaches the host as is bytes in the
++  // image file. Booting a DOS to make one would be a slower way of arriving at
++  // the same two bytes, and what is under test is not the write - it is what a
++  // rewind afterwards does and does not put back.
++  std::vector<uint8_t> image = read_whole_file(disk.path());
++  REQUIRE(image.size() > 0x200);
++  const uint8_t before = image.at(0x100);
++  image.at(0x100) = static_cast<uint8_t>(before ^ 0xFF);
++  write_whole_file(disk.path(), image);
++
++  ok_result("state_load", {{"path", state_file.path}});
++
++  // The machine is back.
++  CHECK(screen_hash() != moved_on);
++  // The disk is not, and the drive still says it is holding the same image -
++  // which is the whole shape of the problem: nothing about the machine after
++  // the load says that what it is about to read has changed underneath it.
++  CHECK(read_whole_file(disk.path()).at(0x100) ==
++        static_cast<uint8_t>(before ^ 0xFF));
++  const Json status = ok_result("disk_status");
++  CHECK(status.at("drives").at(0).at("path").get<std::string>() ==
++        disk.path());
++
++  // So both state commands say which drives the rewind will not reach. A
++  // writable image in a drive is the combination that corrupted a character
++  // disk in this workspace, and a client can act on this: refuse it, warn, or
++  // write-protect the drive before offering to rewind.
++  for (const Json& reply : {saved, ok_result("state_load",
++                                             {{"path", state_file.path}})}) {
++    REQUIRE(reply.contains("disks_not_rewound"));
++    const std::vector<int> at_risk =
++        reply.at("disks_not_rewound").get<std::vector<int>>();
++    CHECK(at_risk == std::vector<int>{0});
++    CHECK(reply.at("disks").at(0).at("path").get<std::string>() ==
++          disk.path());
++  }
++
++  // Write-protected, there is nothing to warn about: the machine cannot change
++  // the image, so a rewind cannot end up disagreeing with one. Which is the
++  // remedy as much as the check - a tool that wants to rewind freely can put
++  // the disk in read-only and stop worrying about it.
++  ok_result("disk_insert",
++            {{"drive", 0}, {"path", disk.path()}, {"write_protected", true}});
++  ok_result("run_frames", {{"frames", 1}});
++  REQUIRE(ok_result("disk_status")
++              .at("drives")
++              .at(0)
++              .at("write_protected")
++              .get<bool>());
++  CHECK(ok_result("state_save", {{"path", state_file.path}})
++            .at("disks_not_rewound")
++            .empty());
++}
++
+ // --- socket framing --------------------------------------------------------
+ 
+ TEST_CASE("Agent server: one line in, one line out") {
+-- 
+2.53.0
+

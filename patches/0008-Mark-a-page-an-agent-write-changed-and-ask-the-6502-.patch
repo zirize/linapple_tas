@@ -1,0 +1,442 @@
+From c843ff5a02f17a47dacdf0b8bbce3ec7fac5076c Mon Sep 17 00:00:00 2001
+From: zirize <zirize@gmail.com>
+Date: Sat, 19 Sep 2026 01:40:44 +0900
+Subject: [PATCH 8/9] Mark a page an agent write changed, and ask the 6502
+ about it
+
+mem_write has been dropping writes. When the page a write lands on is the one
+currently mapped in, the byte goes into the live image rather than into the
+bank's own store, and the next soft switch copies a page back to its bank only
+if something says the page changed. The CPU says so for its own writes. A
+write arriving over the socket had nothing saying so, so the switch threw it
+away and copied the bank's older byte in over it.
+
+For a game keeping its data in the language card that is a fraction of a
+second. A cheat read back correctly, held for as long as nothing happened, and
+then let go with nothing to show that it had.
+
+mem_mark_dirty() says a page changed, and mem_write calls it for a write that
+lands on the live image - not for one that lands in a bank's store, where
+marking the live page would copy the unchanged page back over the write at the
+next switch instead. The test helpers that poke memory do the same, which is
+how the aux case below was failing on its setup rather than on its subject.
+
+Five cases, and what they have in common is that none of them checks a value
+this file decided on. They plant a program at $0300 and ask the 6502:
+
+  - a byte written through bank 1 reads back through "cpu" and not through
+    "main" - and a byte written through "cpu" is still there after the program
+    pages the bank out and back, which is the case that was failing;
+  - all sixteen of $C080-$C08F, each one selected by the program itself, with
+    the cpu view's answer checked against the program's own. The bit patterns
+    are not obvious and the table is not repeated here: the machine is asked
+    what it ended up with;
+  - the aux view, which had never been compared against a running program at
+    all, in both directions - the program writes through $C005 and the agent
+    reads it, the agent writes and the program reads it back through 80STORE;
+  - and the same swapped-out-page trap one bank over, which was failing too.
+
+The sweep also pins down where the two banks live in the main image: bank 2 at
+$D000-$DFFF and bank 1 $1000 lower, so "main" at $DA80 is bank 2 and "main" at
+$CA80 is bank 1. That is the $CA80 that sat in the notes as if it were an
+address of its own.
+
+51 cases.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/apple2/Memory.cpp                        |  15 +
+ src/apple2/Memory.h                          |   1 +
+ src/frontends/common/agent/AgentCommands.cpp |  29 +-
+ tests/test_agent_commands.cpp                | 273 +++++++++++++++++++
+ 4 files changed, 314 insertions(+), 4 deletions(-)
+
+diff --git a/src/apple2/Memory.cpp b/src/apple2/Memory.cpp
+index b5fafb5..cb13c5f 100644
+--- a/src/apple2/Memory.cpp
++++ b/src/apple2/Memory.cpp
+@@ -1044,6 +1044,21 @@ auto mem_get_cx_rom_peripheral() -> uint8_t* {
+ 
+ auto get_mem_ptr(uint16_t addr) -> uint8_t* { return mem + addr; }
+ 
++// Says that the page holding `addr` has been changed in the live image.
++//
++// The live image is not where a byte finally lives: every soft switch that
++// moves a page copies it back to the bank it belongs to, and it copies it back
++// only if this flag says something changed. Nothing changed, nothing is
++// copied, and the bank's older byte is copied in over the edit instead. The
++// CPU sets this on every write it makes; anything that reaches around the CPU
++// and edits `mem` -- the debugger, a program loader, a control channel -- has
++// to say so too, or its edit lasts only until the next switch.
++auto mem_mark_dirty(uint16_t addr) -> void {
++  if (memdirty != nullptr) {
++    memdirty[addr >> 8] = 0xFF;
++  }
++}
++
+ //===========================================================================
+ 
+ // Post:
+diff --git a/src/apple2/Memory.h b/src/apple2/Memory.h
+index 37da272..52d9a24 100644
+--- a/src/apple2/Memory.h
++++ b/src/apple2/Memory.h
+@@ -240,6 +240,7 @@ auto mem_get_aux_ptr(uint16_t addr) -> uint8_t*;
+ auto mem_get_main_ptr(uint16_t addr) -> uint8_t*;
+ auto mem_get_cx_rom_peripheral() -> uint8_t*;
+ auto get_mem_ptr(uint16_t addr) -> uint8_t*;
++auto mem_mark_dirty(uint16_t addr) -> void;
+ auto mem_get_bank_ptr(const uint32_t bank) -> uint8_t*;
+ auto get_mem_mode() -> uint32_t;
+ auto set_mem_mode(uint32_t mode) -> void;
+diff --git a/src/frontends/common/agent/AgentCommands.cpp b/src/frontends/common/agent/AgentCommands.cpp
+index 04e79b9..a5b5473 100644
+--- a/src/frontends/common/agent/AgentCommands.cpp
++++ b/src/frontends/common/agent/AgentCommands.cpp
+@@ -164,6 +164,30 @@ auto memory_view_ptr(const std::string& view, uint16_t address) -> uint8_t* {
+   return mem_get_main_ptr(address);
+ }
+ 
++// Writes one byte through the view the caller asked for, and says whether it
++// landed anywhere.
++//
++// The marking is not an optimisation. When the page a write lands on is the
++// one currently mapped in, the byte goes into the live image rather than into
++// the bank's own store, and the next soft switch copies the page back to its
++// bank only if something says the page changed. The CPU says so for its own
++// writes. A write that arrives over the socket has no CPU behind it, so
++// without this a cheat holds until the game next flips a bank -- which for a
++// game keeping its data in the language card is a fraction of a second -- and
++// then the old byte comes back with nothing to show that it did.
++auto memory_view_write(const std::string& view, uint16_t address, uint8_t value)
++    -> bool {
++  uint8_t* target = memory_view_ptr(view, address);
++  if (target == nullptr) {
++    return false;
++  }
++  *target = value;
++  if (target == get_mem_ptr(address)) {
++    mem_mark_dirty(address);
++  }
++  return true;
++}
++
+ // Reads the view a memory command asked for, defaulting to what the old
+ // `aux` flag meant. Returns false for a name that is not one of the three.
+ auto memory_view_of(const Json& params, std::string* view) -> bool {
+@@ -713,10 +737,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+     for (size_t i = 0; i < bytes.size(); ++i) {
+       const auto address =
+           static_cast<uint16_t>(addr + static_cast<int64_t>(i));
+-      uint8_t* target = memory_view_ptr(view, address);
+-      if (target != nullptr) {
+-        *target = bytes.at(i);
+-      }
++      memory_view_write(view, address, bytes.at(i));
+     }
+     Json result;
+     result["written"] = bytes.size();
+diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
+index bcc73cc..c182dcc 100644
+--- a/tests/test_agent_commands.cpp
++++ b/tests/test_agent_commands.cpp
+@@ -163,16 +163,27 @@ auto base64_decode(const std::string& text) -> std::vector<uint8_t> {
+   return out;
+ }
+ 
++// Puts a byte where the emulator keeps that bank, marking the page the way the
++// CPU marks its own writes. Without the mark a byte that lands on the live
++// image is thrown away by the next soft switch that moves the page, which is
++// a trap for a test setting a screen up as much as for a tool cheating at a
++// game.
+ auto poke_aux(uint16_t address, uint8_t value) -> void {
+   uint8_t* cell = mem_get_aux_ptr(address);
+   REQUIRE(cell != nullptr);
+   *cell = value;
++  if (cell == get_mem_ptr(address)) {
++    mem_mark_dirty(address);
++  }
+ }
+ 
+ auto poke(uint16_t address, uint8_t value) -> void {
+   uint8_t* cell = mem_get_main_ptr(address);
+   REQUIRE(cell != nullptr);
+   *cell = value;
++  if (cell == get_mem_ptr(address)) {
++    mem_mark_dirty(address);
++  }
+ }
+ 
+ // The joystick has no query of its own, so its save state is how a test sees
+@@ -528,6 +539,268 @@ TEST_CASE("Agent: mem_write refuses a payload it cannot place") {
+             .get<std::string>() == "3q2+7w==");
+ }
+ 
++// --- what the program actually reads ---------------------------------------
++//
++// The cases above check the dispatcher's contract: a range refused, a shape
++// returned, a byte that comes back the way it went in. None of that says
++// anything about a banked page, which is how a read of $DA80 spent ten
++// sessions handing back a plausible byte out of a bank that had been paged
++// out. What settles it is not a value a test expects. It is asking the 6502.
++
++namespace {
++
++auto lo_byte(uint16_t address) -> uint8_t {
++  return static_cast<uint8_t>(address & 0xFF);
++}
++
++auto hi_byte(uint16_t address) -> uint8_t {
++  return static_cast<uint8_t>((address >> 8) & 0xFF);
++}
++
++// Where the probe programs leave what they read: past the end of every program
++// below, in a page that none of these switches move. Reading the answer back
++// must not itself depend on the thing under test.
++constexpr uint16_t probe_slot = 0x0320;
++
++// $DA80 is language-card territory - it is where Bard's Tale keeps its
++// character records - and the two banks the card holds are kept a bank apart
++// in the emulator's main image: bank 2 at $D000-$DFFF, bank 1 $1000 lower. So
++// "main" at $DA80 is bank 2 and "main" at $CA80 is bank 1, which is the whole
++// story behind the $CA80 that sat in the notes as if it were an address.
++constexpr uint16_t banked_address = 0xDA80;
++constexpr uint16_t bank1_in_main_image = 0xCA80;
++
++// Reads the probe slot, which is plain main RAM whatever the card is doing.
++auto probe_value() -> uint8_t {
++  const uint8_t* cell = mem_get_main_ptr(probe_slot);
++  REQUIRE(cell != nullptr);
++  return *cell;
++}
++
++auto mem_read_byte(uint16_t address, const char* view) -> uint8_t {
++  const Json result =
++      ok_result("mem_read", {{"addr", address}, {"len", 1}, {"view", view}});
++  CHECK(result.at("view").get<std::string>() == view);
++  const std::vector<uint8_t> bytes =
++      base64_decode(result.at("data").get<std::string>());
++  REQUIRE(bytes.size() == 1);
++  return bytes.at(0);
++}
++
++auto mem_write_byte(uint16_t address, uint8_t value, const char* view) -> void {
++  const Json result = ok_result(
++      "mem_write", {{"addr", address}, {"bytes", {value}}, {"view", view}});
++  CHECK(result.at("written").get<int>() == 1);
++}
++
++// Runs a program at $0300 for long enough that it reaches its parking loop.
++// One frame is seventeen thousand cycles against programs of a dozen bytes.
++auto run_probe(const std::vector<uint8_t>& code) -> void {
++  run_program(0x0300, code);
++  ok_result("run_frames", {{"frames", 1}});
++}
++
++// Selects a language-card bank and copies `from` into the probe slot. The copy
++// is the point: it is the running program's own answer to "what is at this
++// address", which is the only answer a tool that reads a game's memory needs
++// to match.
++auto program_select_and_peek(uint16_t soft_switch, uint16_t from)
++    -> std::vector<uint8_t> {
++  return {0xAD, lo_byte(soft_switch), hi_byte(soft_switch),  // LDA switch
++          0xAD, lo_byte(soft_switch), hi_byte(soft_switch),  // LDA switch
++          0xAD, lo_byte(from),        hi_byte(from),         // LDA from
++          0x8D, lo_byte(probe_slot),  hi_byte(probe_slot),   // STA probe
++          0x4C, 0x0C,                 0x03};                 // JMP $030C
++}
++
++// Writes `value` through bank 1 and then cycles the card - ROM in, bank 1 back
++// - so the page ends up freshly paged in and unmodified. That is the state a
++// game leaves its banks in most of the time, and it is the state in which a
++// write that was only dropped into the live image, without being marked as a
++// change, quietly goes missing at the next switch.
++auto program_write_via_bank(uint16_t soft_switch, uint16_t to, uint8_t value)
++    -> std::vector<uint8_t> {
++  return {0xAD, lo_byte(soft_switch), hi_byte(soft_switch),  // LDA switch
++          0xAD, lo_byte(soft_switch), hi_byte(soft_switch),  // LDA switch
++          0xA9, value,                                       // LDA #value
++          0x8D, lo_byte(to),          hi_byte(to),           // STA to
++          0xAD, 0x82,                 0xC0,                  // LDA $C082 (ROM)
++          0xAD, lo_byte(soft_switch), hi_byte(soft_switch),  // LDA switch
++          0xAD, lo_byte(soft_switch), hi_byte(soft_switch),  // LDA switch
++          0x4C, 0x14,                 0x03};                 // JMP $0314
++}
++
++// Pages the ROM in and the bank back out again before reading, which is what a
++// game does between one screen and the next.
++auto program_peek_across_a_switch(uint16_t soft_switch, uint16_t from)
++    -> std::vector<uint8_t> {
++  return {0xAD, 0x82,                 0xC0,                  // LDA $C082 (ROM)
++          0xAD, lo_byte(soft_switch), hi_byte(soft_switch),  // LDA switch
++          0xAD, lo_byte(soft_switch), hi_byte(soft_switch),  // LDA switch
++          0xAD, lo_byte(from),        hi_byte(from),         // LDA from
++          0x8D, lo_byte(probe_slot),  hi_byte(probe_slot),   // STA probe
++          0x4C, 0x0F,                 0x03};                 // JMP $030F
++}
++
++constexpr uint16_t lc_bank1_rw = 0xC08B;
++constexpr uint16_t lc_bank2_rw = 0xC083;
++constexpr uint16_t lc_rom = 0xC082;
++
++}  // namespace
++
++TEST_CASE("Agent: the running program agrees with a cpu-view read") {
++  HeadlessHarness_t harness;
++  mem_reset_paging();
++
++  constexpr uint8_t by_program = 0x11;
++  constexpr uint8_t in_the_other_bank = 0x22;
++
++  // A byte in the emulator's own main image at the same address, so that a
++  // view mixing the two up cannot pass by accident.
++  mem_write_byte(banked_address, in_the_other_bank, "main");
++  run_probe(program_write_via_bank(lc_bank1_rw, banked_address, by_program));
++
++  // The reading half: what the program put in bank 1 is what "cpu" hands back,
++  // and "main" is a different byte - which is exactly the trap, because a
++  // caller that never says which view it means gets that different byte and
++  // has no way to tell.
++  CHECK(mem_read_byte(banked_address, "cpu") == by_program);
++  CHECK(mem_read_byte(banked_address, "main") == in_the_other_bank);
++  CHECK(mem_read_byte(bank1_in_main_image, "main") == by_program);
++
++  // The writing half, and the harder one. A write through "cpu" has to be a
++  // write the program still sees after the game pages the bank out and back -
++  // otherwise a cheat holds for as long as nothing happens and then lets go.
++  constexpr uint8_t by_agent = 0x5A;
++  mem_write_byte(banked_address, by_agent, "cpu");
++  CHECK(mem_read_byte(banked_address, "cpu") == by_agent);
++
++  run_probe(program_peek_across_a_switch(lc_bank1_rw, banked_address));
++  CHECK(probe_value() == by_agent);
++}
++
++TEST_CASE("Agent: every language-card switch leaves cpu view telling truth") {
++  HeadlessHarness_t harness;
++  mem_reset_paging();
++
++  // Three different bytes in the three places $DA80 can be: the two banks the
++  // card holds, and the ROM underneath that neither test can write.
++  constexpr uint8_t in_bank1 = 0xB1;
++  constexpr uint8_t in_bank2 = 0xB2;
++  run_probe(program_write_via_bank(lc_bank1_rw, banked_address, in_bank1));
++  run_probe(program_write_via_bank(lc_bank2_rw, banked_address, in_bank2));
++  run_probe(program_select_and_peek(lc_rom, banked_address));
++  const uint8_t in_rom = probe_value();
++
++  // The banks have to be distinguishable or the sweep below proves nothing.
++  REQUIRE(in_bank1 != in_bank2);
++  REQUIRE(in_rom != in_bank1);
++  REQUIRE(in_rom != in_bank2);
++
++  // Sixteen switches, and for each one the same question asked twice: once of
++  // the 6502 and once of the agent. Reading $C080-$C08F is how the card is
++  // driven, and the bit patterns are not obvious - $C083 is bank 2, $C08B is
++  // bank 1, an even address with bit 1 clear puts the ROM back. Rather than
++  // encode that table here, which would only be the same guess twice, the
++  // machine is asked what it ended up with.
++  for (uint16_t offset = 0; offset < 16; ++offset) {
++    const auto soft_switch = static_cast<uint16_t>(0xC080 + offset);
++    run_probe(program_select_and_peek(soft_switch, banked_address));
++    const uint8_t seen_by_program = probe_value();
++    CHECK_MESSAGE(mem_read_byte(banked_address, "cpu") == seen_by_program,
++                  "cpu view disagreed with the 6502 after switch offset ",
++                  offset);
++
++    // Whatever the card is doing, the two banks stay where the emulator keeps
++    // them, and a caller reading "main" is reading a store rather than the
++    // live page. Bank 1 is the one at the surprising address.
++    CHECK(mem_read_byte(bank1_in_main_image, "main") == in_bank1);
++    const bool one_of_the_three =
++        seen_by_program == in_bank1 || seen_by_program == in_bank2 ||
++        seen_by_program == in_rom;
++    CHECK(one_of_the_three);
++  }
++}
++
++TEST_CASE("Agent: the aux view is the bank the program wrote") {
++  HeadlessHarness_t harness;
++  mem_reset_paging();
++
++  // $C005 sends writes to the auxiliary bank and $C004 sends them back to
++  // main, which is how a program puts two different bytes at one address. The
++  // program runs from page 3 throughout: these switches move writes only, so
++  // the code it is fetching never moves out from under it.
++  constexpr uint8_t into_aux = 0x5A;
++  constexpr uint8_t into_main = 0xA5;
++  const std::vector<uint8_t> write_both_banks = {
++      0x8D, 0x05, 0xC0,  // STA $C005 - writes go to aux
++      0xA9, into_aux,    // LDA #$5A
++      0x8D, 0x00, 0x60,  // STA $6000
++      0x8D, 0x04, 0xC0,  // STA $C004 - writes go to main again
++      0xA9, into_main,   // LDA #$A5
++      0x8D, 0x00, 0x60,  // STA $6000
++      0x4C, 0x10, 0x03   // JMP $0310
++  };
++  run_probe(write_both_banks);
++
++  CHECK(mem_read_byte(0x6000, "aux") == into_aux);
++  CHECK(mem_read_byte(0x6000, "main") == into_main);
++  CHECK(mem_read_byte(0x6000, "cpu") == into_main);
++
++  // The other direction, and the one that has never been checked against a
++  // running program: a write asked for in the aux view has to be a write the
++  // program can read. It reads it through 80STORE and PAGE2, which swap the
++  // text page for its auxiliary twin without moving the code.
++  constexpr uint8_t into_aux_text = 0x3C;
++  poke(0x0400, into_main);
++  mem_write_byte(0x0400, into_aux_text, "aux");
++
++  const std::vector<uint8_t> read_aux_text = {
++      0x8D, 0x01, 0xC0,  // STA $C001 - 80STORE on
++      0x8D, 0x55, 0xC0,  // STA $C055 - PAGE2: the text page is the aux one
++      0xAD, 0x00, 0x04,  // LDA $0400
++      0x8D, 0x54, 0xC0,  // STA $C054 - PAGE2 off
++      0x8D, 0x20, 0x03,  // STA probe
++      0x8D, 0x00, 0xC0,  // STA $C000 - 80STORE off
++      0x4C, 0x12, 0x03   // JMP $0312
++  };
++  run_probe(read_aux_text);
++  CHECK(probe_value() == into_aux_text);
++  CHECK(mem_read_byte(0x0400, "main") == into_main);
++}
++
++TEST_CASE("Agent: an aux write survives the page being swapped out") {
++  HeadlessHarness_t harness;
++  mem_reset_paging();
++
++  // The same trap as the language card, one bank over. While 80STORE and PAGE2
++  // are on, the auxiliary text page is the live one, so an aux write lands in
++  // the live image rather than in the bank's own store - and if nothing marks
++  // it, the next swap throws it away and the bank's old byte comes back.
++  const std::vector<uint8_t> hold_aux_text = {
++      0x8D, 0x01, 0xC0,  // STA $C001 - 80STORE on
++      0x8D, 0x55, 0xC0,  // STA $C055 - PAGE2 on: aux text page is live
++      0x4C, 0x06, 0x03   // JMP $0306
++  };
++  run_probe(hold_aux_text);
++
++  constexpr uint8_t by_agent = 0x7E;
++  mem_write_byte(0x0400, by_agent, "aux");
++  CHECK(mem_read_byte(0x0400, "aux") == by_agent);
++
++  const std::vector<uint8_t> swap_and_read = {
++      0x8D, 0x54, 0xC0,  // STA $C054 - PAGE2 off, main text page back
++      0x8D, 0x55, 0xC0,  // STA $C055 - PAGE2 on, aux text page again
++      0xAD, 0x00, 0x04,  // LDA $0400
++      0x8D, 0x54, 0xC0,  // STA $C054 - PAGE2 off
++      0x8D, 0x20, 0x03,  // STA probe
++      0x8D, 0x00, 0xC0,  // STA $C000 - 80STORE off
++      0x4C, 0x12, 0x03   // JMP $0312
++  };
++  run_probe(swap_and_read);
++  CHECK(probe_value() == by_agent);
++}
++
+ TEST_CASE("Agent: disk_insert checks the drive and the path length") {
+   HeadlessHarness_t harness;
+ 
+-- 
+2.53.0
+

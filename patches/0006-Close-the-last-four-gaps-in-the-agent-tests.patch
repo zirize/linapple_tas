@@ -1,0 +1,345 @@
+From 53474393a599033793734320b4d98433cb792cb4 Mon Sep 17 00:00:00 2001
+From: zirize <zirize@gmail.com>
+Date: Fri, 18 Sep 2026 14:44:38 +0900
+Subject: [PATCH 6/9] Close the last four gaps in the agent tests
+
+All four were areas only a real game had ever exercised, which is the slowest
+place to find out they had broken.
+
+screen_text in 80 columns reads each pair of columns out of two banks - the
+even column from auxiliary memory, the odd one from main - and only the
+40-column path had ever been checked. The case writes a different pattern into
+each bank and asks for the row: with the auxiliary read removed it comes back
+as "1122334455" instead of "A1B2C3D4E5".
+
+screen_hires and screen_capture hand back memory as base64 and nothing had
+ever decoded it. Both cases decode and compare byte for byte - the hi-res one
+against a pattern rather than a constant, so a decoder that dropped or
+reordered bytes could not pass, and against page 2 as well to show the page
+parameter is honoured.
+
+run_frames turns turbo off to stay reproducible, and turbo belongs to the host
+rather than the machine: not putting it back leaves the window running at the
+wrong speed afterwards. The case also shows why the run asks for it at all -
+the same frames cost the same cycles whether the host was in turbo or not.
+
+And the server holds more than one client: a person watching a session while a
+tool drives it is two connections. Each gets its own reply, told apart by the
+id it sent, and one leaving does not disturb the other.
+
+46 cases.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ tests/test_agent_commands.cpp | 245 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 235 insertions(+), 10 deletions(-)
+
+diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
+index 8f8c447..22a2a07 100644
+--- a/tests/test_agent_commands.cpp
++++ b/tests/test_agent_commands.cpp
+@@ -136,6 +136,39 @@ auto select_text_page1() -> void {
+   touch_switch(0xC051);  // text
+ }
+ 
++// The commands that hand back memory do it as base64, so a test that wants to
++// check the bytes has to undo that. Enough of a decoder for a well-formed
++// payload, which is all the agent produces.
++auto base64_decode(const std::string& text) -> std::vector<uint8_t> {
++  static const std::string alphabet =
++      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++  std::vector<uint8_t> out;
++  uint32_t bits = 0;
++  int have = 0;
++  for (const char c : text) {
++    if (c == '=') {
++      break;
++    }
++    const size_t index = alphabet.find(c);
++    if (index == std::string::npos) {
++      continue;
++    }
++    bits = (bits << 6) | static_cast<uint32_t>(index);
++    have += 6;
++    if (have >= 8) {
++      have -= 8;
++      out.push_back(static_cast<uint8_t>((bits >> have) & 0xFFU));
++    }
++  }
++  return out;
++}
++
++auto poke_aux(uint16_t address, uint8_t value) -> void {
++  uint8_t* cell = mem_get_aux_ptr(address);
++  REQUIRE(cell != nullptr);
++  *cell = value;
++}
++
+ auto poke(uint16_t address, uint8_t value) -> void {
+   uint8_t* cell = mem_get_main_ptr(address);
+   REQUIRE(cell != nullptr);
+@@ -249,20 +282,29 @@ struct AgentSocketFixture_t {
+     REQUIRE(agent_server_is_active());
+   }
+ 
+-  auto connect_client() -> void {
+-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+-    REQUIRE(fd >= 0);
++  // Opens another connection to the same socket and hands back its fd. The
++  // server is meant to hold more than one client - a person watching a session
++  // while a tool drives it is two - so a test needs to be able to be both.
++  auto open_client() -> int {
++    const int client = socket(AF_UNIX, SOCK_STREAM, 0);
++    REQUIRE(client >= 0);
+     sockaddr_un addr = {};
+     addr.sun_family = AF_UNIX;
+     std::memcpy(static_cast<void*>(addr.sun_path), path.c_str(),
+                 path.size() + 1);
+-    REQUIRE(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
++    REQUIRE(connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) ==
++            0);
+     // Non-blocking on this side too: the server drains only when the test
+     // pumps it, so a blocking write of a large request would deadlock against
+     // a test that is waiting to make that very call.
+-    const int flags = fcntl(fd, F_GETFL, 0);
+-    REQUIRE(fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
++    const int flags = fcntl(client, F_GETFL, 0);
++    REQUIRE(fcntl(client, F_SETFL, flags | O_NONBLOCK) == 0);
+     agent_server_poll(0);
++    return client;
++  }
++
++  auto connect_client() -> void {
++    fd = open_client();
+     REQUIRE(agent_server_client_count() == 1);
+   }
+ 
+@@ -273,11 +315,13 @@ struct AgentSocketFixture_t {
+     }
+   }
+ 
+-  auto send_raw(const std::string& payload) -> void {
++  auto send_raw(const std::string& payload) -> void { send_raw(fd, payload); }
++
++  auto send_raw(int client, const std::string& payload) -> void {
+     size_t sent = 0;
+     while (sent < payload.size()) {
+-      const ssize_t written =
+-          send(fd, payload.data() + sent, payload.size() - sent, MSG_NOSIGNAL);
++      const ssize_t written = send(client, payload.data() + sent,
++                                   payload.size() - sent, MSG_NOSIGNAL);
+       if (written > 0) {
+         sent += static_cast<size_t>(written);
+         continue;
+@@ -295,12 +339,16 @@ struct AgentSocketFixture_t {
+   // has arrived, or the budget runs out. A bounded loop rather than a blocking
+   // read keeps a regression from turning into a hung test run.
+   auto collect_replies(size_t count) -> std::vector<std::string> {
++    return collect_replies(fd, count);
++  }
++
++  auto collect_replies(int client, size_t count) -> std::vector<std::string> {
+     std::string inbox;
+     std::vector<std::string> lines;
+     for (int attempt = 0; attempt < 200 && lines.size() < count; ++attempt) {
+       agent_server_poll(1);
+       std::vector<char> chunk(4096);
+-      const ssize_t got = recv(fd, chunk.data(), chunk.size(), 0);
++      const ssize_t got = recv(client, chunk.data(), chunk.size(), 0);
+       if (got > 0) {
+         inbox.append(chunk.data(), static_cast<size_t>(got));
+       }
+@@ -942,6 +990,140 @@ TEST_CASE("Agent: the input commands check their sizes") {
+   agent_input_set_capture(false, 0);
+ }
+ 
++// --- what the screen commands hand back ------------------------------------
++
++TEST_CASE("Agent: screen_text reads 80 columns out of both banks") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++  touch_switch(0xC00D);  // 80 columns
++  REQUIRE(video_get_sw_80col());
++
++  // In 80-column text each pair of columns shares one address: the even column
++  // is the auxiliary bank's byte, the odd one is main memory's. Reading only
++  // main would give 40 columns of the wrong half.
++  const uint16_t row0 = 0x0400;
++  for (int pair = 0; pair < 5; ++pair) {
++    poke_aux(static_cast<uint16_t>(row0 + pair),
++             static_cast<uint8_t>(0xC1 + pair));  // A B C D E
++    poke(static_cast<uint16_t>(row0 + pair),
++         static_cast<uint8_t>(0xB1 + pair));  // 1 2 3 4 5
++  }
++
++  const Json result = ok_result("screen_text");
++  CHECK(result.at("columns").get<int>() == 80);
++  CHECK(result.at("rows").get<int>() == 24);
++  const std::string first = result.at("lines").at(0).get<std::string>();
++  REQUIRE(first.size() == 80);
++  CHECK(first.substr(0, 10) == "A1B2C3D4E5");
++
++  // And back to 40 columns, where the same row is main memory alone.
++  touch_switch(0xC00C);
++  const Json narrow = ok_result("screen_text");
++  CHECK(narrow.at("columns").get<int>() == 40);
++  CHECK(narrow.at("lines").at(0).get<std::string>().substr(0, 5) == "12345");
++}
++
++TEST_CASE("Agent: screen_hires hands back the page byte for byte") {
++  HeadlessHarness_t harness;
++
++  // A pattern rather than a constant: a decoder that drops or reorders bytes
++  // passes a run of identical ones.
++  for (size_t i = 0; i < 0x2000; ++i) {
++    poke(static_cast<uint16_t>(0x2000 + i),
++         static_cast<uint8_t>((i * 7) & 0xFF));
++  }
++  poke(0x2000, 0xFF);
++  poke(0x3FFF, 0x80);
++
++  const Json result = ok_result("screen_hires", {{"page", 1}});
++  CHECK(result.at("addr").get<int>() == 0x2000);
++  CHECK(result.at("len").get<int>() == 0x2000);
++  const std::vector<uint8_t> data =
++      base64_decode(result.at("data").get<std::string>());
++  REQUIRE(data.size() == 0x2000);
++  CHECK(data.front() == 0xFF);
++  CHECK(data.back() == 0x80);
++  bool matches = true;
++  for (size_t i = 1; i + 1 < data.size(); ++i) {
++    if (data.at(i) != static_cast<uint8_t>((i * 7) & 0xFF)) {
++      matches = false;
++      break;
++    }
++  }
++  CHECK(matches);
++
++  // Page 2 is a different 8 KB, and asking for it must not answer with page 1.
++  poke(0x4000, 0x11);
++  const std::vector<uint8_t> page2 = base64_decode(
++      ok_result("screen_hires", {{"page", 2}}).at("data").get<std::string>());
++  REQUIRE(page2.size() == 0x2000);
++  CHECK(page2.front() == 0x11);
++}
++
++TEST_CASE("Agent: screen_capture hands back the frame buffer as it stands") {
++  HeadlessHarness_t harness;
++  harness.run_frames(2);
++
++  const Json result = ok_result("screen_capture");
++  CHECK(result.at("format").get<std::string>() == "bgra8888");
++  const auto width = result.at("width").get<uint32_t>();
++  const auto height = result.at("height").get<uint32_t>();
++  CHECK(width == video_width);
++  CHECK(height == video_height);
++
++  const std::vector<uint8_t> data =
++      base64_decode(result.at("data").get<std::string>());
++  REQUIRE(data.size() ==
++          static_cast<size_t>(width) * height * sizeof(uint32_t));
++
++  const uint32_t* pixels = video_get_output_buffer();
++  REQUIRE(pixels != nullptr);
++  const auto* bytes = reinterpret_cast<const uint8_t*>(pixels);
++  bool same = true;
++  for (size_t i = 0; i < data.size(); ++i) {
++    if (data.at(i) != bytes[i]) {
++      same = false;
++      break;
++    }
++  }
++  CHECK(same);
++}
++
++// --- what a run does to the machine's settings ------------------------------
++
++TEST_CASE("Agent: a deterministic run gives the turbo setting back") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++  run_program(0x0300, program_idle);
++
++  ok_result("turbo_set", {{"turbo", true}});
++  REQUIRE(ok_result("status").at("turbo").get<bool>());
++
++  const Json params = {{"frames", 3}, {"deterministic", true}};
++  const uint64_t hot =
++      ok_result("run_frames", params).at("cycles").get<uint64_t>();
++  // Turbo is the host's business, not the machine's, so a run that turns it
++  // off to stay reproducible has to put it back or the next thing the person
++  // does at the window runs at the wrong speed.
++  CHECK(ok_result("status").at("turbo").get<bool>());
++  CHECK(ok_result("status").at("mode").get<std::string>() == "paused");
++
++  ok_result("turbo_set", {{"turbo", false}});
++  const uint64_t cold =
++      ok_result("run_frames", params).at("cycles").get<uint64_t>();
++  CHECK_FALSE(ok_result("status").at("turbo").get<bool>());
++
++  // Which is the point of asking for a deterministic run: the same frames cost
++  // the same cycles whatever the host was set to.
++  CHECK(hot == cold);
++
++  // A run that did not ask for determinism leaves the setting alone as well.
++  ok_result("turbo_set", {{"turbo", true}});
++  ok_result("run_frames", {{"frames", 1}, {"deterministic", false}});
++  CHECK(ok_result("status").at("turbo").get<bool>());
++  ok_result("turbo_set", {{"turbo", false}});
++}
++
+ // --- slot 0 shares one id space ---------------------------------------------
+ 
+ namespace {
+@@ -1234,6 +1416,49 @@ TEST_CASE("Agent server: a request line past the cap drops the client") {
+   CHECK(agent_server_client_count() == 0);
+ }
+ 
++TEST_CASE("Agent server: two clients are answered separately") {
++  AgentSocketFixture_t socket_fixture;
++  socket_fixture.start();
++  socket_fixture.connect_client();
++  const int second = socket_fixture.open_client();
++  CHECK(agent_server_client_count() == 2);
++
++  // Each connection carries its own request and gets its own reply: a session
++  // a person is watching while a tool drives it is two clients, and an answer
++  // delivered to the wrong one is worse than no answer.
++  socket_fixture.send_raw(socket_fixture.fd, "{\"id\":11,\"cmd\":\"ping\"}\n");
++  socket_fixture.send_raw(second, "{\"id\":22,\"cmd\":\"status\"}\n");
++
++  const std::vector<std::string> first_replies =
++      socket_fixture.collect_replies(socket_fixture.fd, 1);
++  const std::vector<std::string> second_replies =
++      socket_fixture.collect_replies(second, 1);
++  REQUIRE(first_replies.size() == 1);
++  REQUIRE(second_replies.size() == 1);
++
++  const Json first = Json::parse(first_replies.at(0), nullptr, false);
++  const Json other = Json::parse(second_replies.at(0), nullptr, false);
++  REQUIRE_FALSE(first.is_discarded());
++  REQUIRE_FALSE(other.is_discarded());
++  CHECK(first.at("id").get<int>() == 11);
++  CHECK(other.at("id").get<int>() == 22);
++  CHECK(first.at("ok").get<bool>());
++  CHECK(other.at("result").contains("mode"));
++
++  // One client leaving does not take the other with it.
++  close(second);
++  agent_server_poll(0);
++  CHECK(agent_server_client_count() == 1);
++
++  socket_fixture.send_raw(socket_fixture.fd, "{\"id\":33,\"cmd\":\"ping\"}\n");
++  const std::vector<std::string> after =
++      socket_fixture.collect_replies(socket_fixture.fd, 1);
++  REQUIRE(after.size() == 1);
++  const Json still = Json::parse(after.at(0), nullptr, false);
++  REQUIRE_FALSE(still.is_discarded());
++  CHECK(still.at("id").get<int>() == 33);
++}
++
+ TEST_CASE("Agent server: stopping releases the socket path") {
+   AgentSocketFixture_t socket_fixture;
+   socket_fixture.start();
+-- 
+2.53.0
+

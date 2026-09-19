@@ -1,0 +1,35 @@
+{
+  "name": "applesoft",
+  "description": "Drives the Applesoft interpreter in ROM. Needs no game disk: boot any disk to the monitor, then attach.",
+  "_note": "The smallest profile that does something. It shows the three pieces every profile has - a regex on what is on screen, the keys to send, and a rule that ends the run - against a machine anyone can reproduce.",
+  "poll_frames": 30,
+  "rules": [
+    {
+      "_note": "First, because the prompt is still on screen after the answer is printed and the rule below would otherwise ask again forever.",
+      "name": "answer-printed",
+      "when": "^\\s*4\\s*$",
+      "do": [
+        { "stop": "Applesoft printed the answer" }
+      ]
+    },
+    {
+      "name": "ask-applesoft",
+      "when": "^\\s*\\]\\s*$",
+      "do": [
+        { "type": "PRINT 2+2" },
+        { "key": 13 },
+        { "wait": 90 }
+      ]
+    },
+    {
+      "_note": "The monitor prompt. $E000 is where Applesoft starts.",
+      "name": "enter-applesoft",
+      "when": "^\\s*\\*",
+      "do": [
+        { "type": "E000G" },
+        { "key": 13 },
+        { "wait": 120 }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,167 @@
+{
+  "note": "Types an Applesoft expression one keystroke at a time. Needs no game disk, but it does need a starting state, and a state is the whole machine -- ROM included -- so it is not shipped here. Make your own: boot any disk, enter Applesoft with E000G, then state_save. Point --state at that file.",
+  "state": "applesoft.state",
+  "events": [
+    {
+      "frame": 60,
+      "cmd": "key_state",
+      "params": {
+        "key": 80,
+        "down": true
+      }
+    },
+    {
+      "frame": 64,
+      "cmd": "key_state",
+      "params": {
+        "key": 80,
+        "down": false
+      }
+    },
+    {
+      "frame": 70,
+      "cmd": "key_state",
+      "params": {
+        "key": 82,
+        "down": true
+      }
+    },
+    {
+      "frame": 74,
+      "cmd": "key_state",
+      "params": {
+        "key": 82,
+        "down": false
+      }
+    },
+    {
+      "frame": 80,
+      "cmd": "key_state",
+      "params": {
+        "key": 73,
+        "down": true
+      }
+    },
+    {
+      "frame": 84,
+      "cmd": "key_state",
+      "params": {
+        "key": 73,
+        "down": false
+      }
+    },
+    {
+      "frame": 90,
+      "cmd": "key_state",
+      "params": {
+        "key": 78,
+        "down": true
+      }
+    },
+    {
+      "frame": 94,
+      "cmd": "key_state",
+      "params": {
+        "key": 78,
+        "down": false
+      }
+    },
+    {
+      "frame": 100,
+      "cmd": "key_state",
+      "params": {
+        "key": 84,
+        "down": true
+      }
+    },
+    {
+      "frame": 104,
+      "cmd": "key_state",
+      "params": {
+        "key": 84,
+        "down": false
+      }
+    },
+    {
+      "frame": 110,
+      "cmd": "key_state",
+      "params": {
+        "key": 32,
+        "down": true
+      }
+    },
+    {
+      "frame": 114,
+      "cmd": "key_state",
+      "params": {
+        "key": 32,
+        "down": false
+      }
+    },
+    {
+      "frame": 120,
+      "cmd": "key_state",
+      "params": {
+        "key": 51,
+        "down": true
+      }
+    },
+    {
+      "frame": 124,
+      "cmd": "key_state",
+      "params": {
+        "key": 51,
+        "down": false
+      }
+    },
+    {
+      "frame": 130,
+      "cmd": "key_state",
+      "params": {
+        "key": 42,
+        "down": true
+      }
+    },
+    {
+      "frame": 134,
+      "cmd": "key_state",
+      "params": {
+        "key": 42,
+        "down": false
+      }
+    },
+    {
+      "frame": 140,
+      "cmd": "key_state",
+      "params": {
+        "key": 55,
+        "down": true
+      }
+    },
+    {
+      "frame": 144,
+      "cmd": "key_state",
+      "params": {
+        "key": 55,
+        "down": false
+      }
+    },
+    {
+      "frame": 150,
+      "cmd": "key_state",
+      "params": {
+        "key": 13,
+        "down": true
+      }
+    },
+    {
+      "frame": 154,
+      "cmd": "key_state",
+      "params": {
+        "key": 13,
+        "down": false
+      }
+    }
+  ],
+  "frames": 400
+}

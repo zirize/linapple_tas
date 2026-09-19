@@ -1,0 +1,173 @@
+From 71f33d86b924592b0ecaebd668140ee1217262cc Mon Sep 17 00:00:00 2001
+From: zirize <zirize@gmail.com>
+Date: Sat, 19 Sep 2026 00:36:36 +0900
+Subject: [PATCH 7/9] Let a caller read the memory the program is actually
+ reading
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+mem_read and mem_write have always gone through mem_get_main_ptr, which
+hands back the emulator's own main image. For a page the CPU is reading
+straight that is the same byte. For a page the language card has swapped in
+it is not: the live bytes are in the CPU image and the main image holds
+whatever was there when the bank was last paged out.
+
+That is not a corner case. The Bard's Tale keeps its party records in
+language-card RAM at $DA80, and through the old path they read back as a
+plausible copy that goes stale, and writes to them land somewhere the game
+never looks — a cheat that reads back correctly and changes nothing.
+
+So mem_read and mem_write now take view: "cpu", "main" or "aux". The
+default is unchanged, the response says which image answered, and an
+unknown name is refused rather than quietly treated as main.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/frontends/common/agent/AgentCommands.cpp | 54 +++++++++++++++++---
+ tests/test_agent_commands.cpp                | 32 ++++++++++++
+ 2 files changed, 80 insertions(+), 6 deletions(-)
+
+diff --git a/src/frontends/common/agent/AgentCommands.cpp b/src/frontends/common/agent/AgentCommands.cpp
+index d8560cc..04e79b9 100644
+--- a/src/frontends/common/agent/AgentCommands.cpp
++++ b/src/frontends/common/agent/AgentCommands.cpp
+@@ -143,6 +143,42 @@ auto param_string(const Json& params, const char* key) -> std::string {
+   return params.at(key).get<std::string>();
+ }
+ 
++// Which image a memory command should look at.
++//
++// "main" and "aux" are the banks as the emulator stores them, and they are
++// not always what the program is reading. The language card swaps a bank in
++// over $D000-$FFFF, and while it is swapped the live bytes live in the CPU
++// image; the copy in `memmain` is whatever was there when the bank was last
++// paged out. A caller that wants the value the running program would read --
++// or wants a write the program will actually see -- asks for "cpu".
++//
++// The default stays "main"/"aux" so that callers written before this option
++// keep the behaviour they were written against.
++auto memory_view_ptr(const std::string& view, uint16_t address) -> uint8_t* {
++  if (view == "cpu") {
++    return get_mem_ptr(address);
++  }
++  if (view == "aux") {
++    return mem_get_aux_ptr(address);
++  }
++  return mem_get_main_ptr(address);
++}
++
++// Reads the view a memory command asked for, defaulting to what the old
++// `aux` flag meant. Returns false for a name that is not one of the three.
++auto memory_view_of(const Json& params, std::string* view) -> bool {
++  const std::string named = param_string(params, "view");
++  if (named.empty()) {
++    *view = param_bool(params, "aux", false) ? "aux" : "main";
++    return true;
++  }
++  if (named != "cpu" && named != "main" && named != "aux") {
++    return false;
++  }
++  *view = named;
++  return true;
++}
++
+ // --- run control -----------------------------------------------------------
+ 
+ // Runs exactly `frames` emulated frames and parks the machine again. Turbo and
+@@ -627,18 +663,21 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+         (addr + len) > 0x10000) {
+       return make_error(request, "len out of range");
+     }
+-    const bool aux = param_bool(params, "aux", false);
++    std::string view;
++    if (!memory_view_of(params, &view)) {
++      return make_error(request, "view must be cpu, main or aux");
++    }
+     std::vector<uint8_t> buffer;
+     buffer.reserve(static_cast<size_t>(len));
+     for (int64_t i = 0; i < len; ++i) {
+       const auto address = static_cast<uint16_t>(addr + i);
+-      const uint8_t* byte =
+-          aux ? mem_get_aux_ptr(address) : mem_get_main_ptr(address);
++      const uint8_t* byte = memory_view_ptr(view, address);
+       buffer.push_back(byte != nullptr ? *byte : 0);
+     }
+     Json result;
+     result["addr"] = addr;
+     result["len"] = len;
++    result["view"] = view;
+     result["data"] = base64_encode(buffer.data(), buffer.size());
+     return make_ok(request, result);
+   }
+@@ -667,18 +706,21 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+         (addr + static_cast<int64_t>(bytes.size())) > 0x10000) {
+       return make_error(request, "write range out of bounds");
+     }
+-    const bool aux = param_bool(params, "aux", false);
++    std::string view;
++    if (!memory_view_of(params, &view)) {
++      return make_error(request, "view must be cpu, main or aux");
++    }
+     for (size_t i = 0; i < bytes.size(); ++i) {
+       const auto address =
+           static_cast<uint16_t>(addr + static_cast<int64_t>(i));
+-      uint8_t* target =
+-          aux ? mem_get_aux_ptr(address) : mem_get_main_ptr(address);
++      uint8_t* target = memory_view_ptr(view, address);
+       if (target != nullptr) {
+         *target = bytes.at(i);
+       }
+     }
+     Json result;
+     result["written"] = bytes.size();
++    result["view"] = view;
+     return make_ok(request, result);
+   }
+ 
+diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
+index 22a2a07..bcc73cc 100644
+--- a/tests/test_agent_commands.cpp
++++ b/tests/test_agent_commands.cpp
+@@ -476,6 +476,38 @@ TEST_CASE("Agent: mem_read returns what memory holds") {
+   CHECK(result.at("data").get<std::string>() == "3q2+7w==");
+ }
+ 
++TEST_CASE("Agent: mem_read can be asked which image to read") {
++  HeadlessHarness_t harness;
++
++  CHECK(rejects("mem_read", {{"addr", 0x6000}, {"view", "bogus"}}));
++  CHECK(rejects("mem_write",
++                {{"addr", 0x6000}, {"bytes", {1}}, {"view", "bogus"}}));
++
++  // Plain RAM is the same byte whichever way it is asked for, and the answer
++  // says which image it came from.
++  poke(0x6000, 0x5A);
++  for (const char* view : {"cpu", "main"}) {
++    const Json result =
++        ok_result("mem_read", {{"addr", 0x6000}, {"len", 1}, {"view", view}});
++    CHECK(result.at("view").get<std::string>() == view);
++    CHECK(result.at("data").get<std::string>() == "Wg==");
++  }
++
++  // $D000 is where the two part company: the CPU is reading ROM there, while
++  // the emulator's own main image holds RAM underneath it. A caller that
++  // wants what the running program sees has to say so — this is the whole
++  // reason the option exists, and a game that keeps its data in language-card
++  // RAM is invisible without it.
++  ok_result("mem_write",
++            {{"addr", 0xD000}, {"bytes", {0xA5}}, {"view", "main"}});
++  CHECK(ok_result("mem_read", {{"addr", 0xD000}, {"len", 1}, {"view", "main"}})
++            .at("data")
++            .get<std::string>() == "pQ==");
++  CHECK(ok_result("mem_read", {{"addr", 0xD000}, {"len", 1}, {"view", "cpu"}})
++            .at("data")
++            .get<std::string>() != "pQ==");
++}
++
+ TEST_CASE("Agent: mem_write refuses a payload it cannot place") {
+   HeadlessHarness_t harness;
+ 
+-- 
+2.53.0
+

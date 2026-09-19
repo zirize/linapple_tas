@@ -1,0 +1,3414 @@
+From 64681686b288eefebfe3bc4232a534e6971cc713 Mon Sep 17 00:00:00 2001
+From: zirize <zirize@gmail.com>
+Date: Fri, 18 Sep 2026 13:42:14 +0900
+Subject: [PATCH 1/9] Add an agent socket control channel
+
+A Unix socket, one JSON request per line, that lets a program drive the
+machine the way a person drives the window: keys and stick, disks, memory
+and registers, the screen, save states, and frames.
+
+Frames are the point of it. An agent cannot keep up with an emulator in
+real time, so the machine is parked and run a step at a time by whoever
+is connected, which makes a session reproducible: the same state and the
+same inputs give the same cycle counts and the same screen. run_frames
+advances it, run_until_change waits inside the emulator rather than
+having a client poll the screen over the socket, and screen_hash follows
+whichever page is actually being displayed so text-mode programs are not
+watched on a hi-res page that never changes.
+
+The socket also sees what a person does at the window. The frontends log
+every keystroke and stick movement to the agent as well, stamped with the
+cycle it happened on, so a recorder can capture a live session and play
+it back. What is logged for a key is the byte the keyboard will latch,
+not the key the frontend named - shift, caps lock, layout and custom maps
+are the keyboard's business, and it is asked through a new
+keyboard_query_translate rather than guessed at.
+
+Sound can be recorded from the socket too. The dumper was wired to the
+SDL frontends only, which left headless - the one place a recording plays
+back deterministically - with nothing. The samples the core hands the
+frontend are stereo at 44100, the same shape the SDL frontends dump, and
+they arrive on emulated time, so a session replayed as fast as the host
+allows still writes a file that plays at the right speed.
+
+Three fixes came out of testing it:
+
+  * joy_axis was sending SET_TRIM, a shared centre offset, instead of
+    SET_AXIS, so both sticks moved together and the second stick's axes
+    folded onto the first one's Y. A one-stick game hid it.
+  * Slot 0 dispatches a command to every peripheral in it, and the
+    keyboard's event id and the joystick's set-button id are both 1. The
+    joystick only checked that the payload was big enough, so a key event
+    was read as a button payload and Ctrl-A released a held button.
+  * The frontend's joystick path passed Linux's -32767..32767 straight
+    through, so every stick movement went to the rail.
+
+An idle session used to hold a core at full clock. The agent loop blocks
+in poll() when the machine is paused and paces itself to the Apple II's
+frame rate when it is running, which takes it from 500 wake-ups a second
+to 5.
+
+Built with -DENABLE_AGENT (default on) and covered by
+tests/test_agent_commands.cpp - 34 cases, no game disk needed.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ CMakeLists.txt                                |   26 +-
+ src/apple2/peripherals/joystick/Joystick.cpp  |   10 +-
+ src/apple2/peripherals/keyboard/Keyboard.cpp  |   68 +-
+ .../peripherals/keyboard/KeyboardCommands.h   |   20 +-
+ src/core/LinAppleCore.cpp                     |   18 +-
+ src/frontends/common/AppArgs.cpp              |   11 +-
+ src/frontends/common/AppConfig.h              |    1 +
+ src/frontends/common/AudioDumper.cpp          |   16 +
+ src/frontends/common/Frontend.h               |    9 +
+ src/frontends/common/agent/AgentCommands.cpp  |  932 +++++++++++++++
+ src/frontends/common/agent/AgentCommands.h    |    9 +
+ src/frontends/common/agent/AgentInput.cpp     |  120 ++
+ src/frontends/common/agent/AgentInput.h       |   61 +
+ src/frontends/common/agent/AgentServer.cpp    |  297 +++++
+ src/frontends/common/agent/AgentServer.h      |   23 +
+ src/frontends/common/sdl/JoystickFrontend.cpp |   63 +-
+ src/frontends/common/sdl/Keyboard.cpp         |    4 +
+ src/frontends/headless/Main.cpp               |  123 +-
+ src/frontends/sdl3/Main.cpp                   |   56 +-
+ src/frontends/tui/TuiInput.cpp                |    8 +-
+ tests/test_agent_commands.cpp                 | 1000 +++++++++++++++++
+ 21 files changed, 2819 insertions(+), 56 deletions(-)
+ create mode 100644 src/frontends/common/agent/AgentCommands.cpp
+ create mode 100644 src/frontends/common/agent/AgentCommands.h
+ create mode 100644 src/frontends/common/agent/AgentInput.cpp
+ create mode 100644 src/frontends/common/agent/AgentInput.h
+ create mode 100644 src/frontends/common/agent/AgentServer.cpp
+ create mode 100644 src/frontends/common/agent/AgentServer.h
+ create mode 100644 tests/test_agent_commands.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bbae71a..b28c9b4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -32,6 +32,7 @@ else()
+     set(FRONTEND_HAS_FTP ON)
+ endif()
+ option(ENABLE_DEBUGGER "Enable integrated debugger" ${DEFAULT_ENABLE_DEBUGGER})
++option(ENABLE_AGENT "Enable the Unix socket tool-assistant control channel" ON)
+ 
+ option(PROFILING "Enable profiling" OFF)
+ option(REGISTRY_WRITEABLE "Enable registry writing" ON)
+@@ -373,6 +374,18 @@ set(SOURCES_CORE
+     src/frontends/common/PrinterFrontend.cpp
+ )
+ 
++if(ENABLE_AGENT)
++    find_package(nlohmann_json 3.9 REQUIRED)
++    list(APPEND SOURCES_CORE
++        src/frontends/common/agent/AgentServer.cpp
++        src/frontends/common/agent/AgentCommands.cpp
++        src/frontends/common/agent/AgentInput.cpp
++    )
++    set(AGENT_LIBS nlohmann_json::nlohmann_json)
++else()
++    set(AGENT_LIBS "")
++endif()
++
+ set(SOURCES_A2_MANDATORY
+     src/apple2/chips/6821.cpp
+     src/apple2/CPU.cpp
+@@ -538,7 +551,10 @@ function(add_linapple_executable TARGET_NAME FE_NAME FE_SOURCES DBG_SOURCES EXTR
+     endif()
+     set_target_properties(${TARGET_NAME} PROPERTIES ENABLE_EXPORTS TRUE)
+     target_include_directories(${TARGET_NAME} PRIVATE ${LINAPPLE_INCLUDES} ${EXTRA_INCLUDES})
+-    target_link_libraries(${TARGET_NAME} PRIVATE ${COMMON_LIBS} ${EXTRA_LIBS})
++    target_link_libraries(${TARGET_NAME} PRIVATE ${COMMON_LIBS} ${EXTRA_LIBS} ${AGENT_LIBS})
++    if(ENABLE_AGENT)
++        target_compile_definitions(${TARGET_NAME} PRIVATE LINAPPLE_AGENT=1)
++    endif()
+     if(FE_NAME STREQUAL "sdl1")
+         list(APPEND EXTRA_DEFS LINAPPLE_SDL_VERSION=1)
+     elseif(FE_NAME STREQUAL "sdl2")
+@@ -608,6 +624,10 @@ if(BUILD_TESTING)
+     # Helper for adding tests
+     macro(add_linapple_test name sources)
+         add_executable(test-${name} ${sources} ${SOURCES_CORE} ${SOURCES_A2_MANDATORY} ${SOURCES_DBG} ${SOURCES_A2_OPTIONAL} src/frontends/headless/Stubs.cpp src/frontends/headless/Headless_Path.cpp)
++        if(ENABLE_AGENT)
++            target_link_libraries(test-${name} PRIVATE ${AGENT_LIBS})
++            target_compile_definitions(test-${name} PRIVATE LINAPPLE_AGENT=1)
++        endif()
+         add_dependencies(test-${name} generate_xpms generate_embedded_roms)
+         if(PERIPHERAL_MODULES)
+             add_dependencies(test-${name} ${PERIPHERAL_MODULES})
+@@ -681,6 +701,10 @@ if(BUILD_TESTING)
+     add_linapple_test(disk-config-runtime-eject tests/test_disk_config_runtime_eject.cpp)
+     add_linapple_test(headless-boot "tests/HeadlessHarness.cpp;tests/test_headless_boot.cpp")
+ 
++    if(ENABLE_AGENT)
++        add_linapple_test(agent-commands "tests/HeadlessHarness.cpp;tests/test_agent_commands.cpp")
++    endif()
++
+     add_linapple_test(file-browser tests/test_file_browser.cpp)
+ 
+     add_executable(test-util-hash tests/test_util_hash.cpp src/frontends/common/Util_Hash.cpp)
+diff --git a/src/apple2/peripherals/joystick/Joystick.cpp b/src/apple2/peripherals/joystick/Joystick.cpp
+index b1604ee..b0769ec 100644
+--- a/src/apple2/peripherals/joystick/Joystick.cpp
++++ b/src/apple2/peripherals/joystick/Joystick.cpp
+@@ -228,7 +228,11 @@ static auto joystick_abi_command(void* instance, uint32_t cmd, const void* data,
+ 
+   switch (cmd) {
+     case JOY_CMD_SET_AXIS: {
+-      if (data == nullptr || size < sizeof(JoystickAxisPayload_t)) {
++      // Exactly this payload, not merely enough of one. Slot 0 is shared and
++      // the command ids overlap - a keyboard event is also id 1 - so a command
++      // meant for another peripheral arrives here too, and a length test that
++      // accepts anything larger reads it as a joystick payload.
++      if (data == nullptr || size != sizeof(JoystickAxisPayload_t)) {
+         return peripheral_error;
+       }
+       const auto* payload = static_cast<const JoystickAxisPayload_t*>(data);
+@@ -243,7 +247,7 @@ static auto joystick_abi_command(void* instance, uint32_t cmd, const void* data,
+       return peripheral_ok;
+     }
+     case JOY_CMD_SET_BUTTON: {
+-      if (data == nullptr || size < sizeof(JoystickButtonPayload_t)) {
++      if (data == nullptr || size != sizeof(JoystickButtonPayload_t)) {
+         return peripheral_error;
+       }
+       const auto* payload = static_cast<const JoystickButtonPayload_t*>(data);
+@@ -258,7 +262,7 @@ static auto joystick_abi_command(void* instance, uint32_t cmd, const void* data,
+       return peripheral_ok;
+     }
+     case JOY_CMD_SET_TRIM: {
+-      if (data == nullptr || size < sizeof(JoystickTrimPayload_t)) {
++      if (data == nullptr || size != sizeof(JoystickTrimPayload_t)) {
+         return peripheral_error;
+       }
+       const auto* payload = static_cast<const JoystickTrimPayload_t*>(data);
+diff --git a/src/apple2/peripherals/keyboard/Keyboard.cpp b/src/apple2/peripherals/keyboard/Keyboard.cpp
+index 9d514f8..7caa15f 100644
+--- a/src/apple2/peripherals/keyboard/Keyboard.cpp
++++ b/src/apple2/peripherals/keyboard/Keyboard.cpp
+@@ -435,6 +435,44 @@ auto keyboard_apply_symbolic_shift(uint32_t key, bool shift, bool ctrl,
+   return key;
+ }
+ 
++// What a key event turns into for the machine, without pressing anything.
++//
++// The command handler below uses this to decide what to latch, and the
++// keyboard_query_translate query hands the same answer to a caller that only
++// wants to know - a recorder logging what a person typed, for instance, which
++// has to write down the byte a replay would send rather than the key the
++// frontend happened to name. False means the key reaches the machine as
++// nothing at all: an Apple key, or one this layout has no byte for.
++auto keyboard_translate_key(KeyboardPeripheral_t* kp, const KeyboardEvent_t* ev,
++                            uint32_t* out) -> bool {
++  namespace kp_const = kb;
++
++  if (kp->logic.has_custom_keys && ev->key >= kp_const::positional_threshold) {
++    const int idx = static_cast<int>(ev->key - kp_const::positional_threshold);
++    if (idx >= 0 && idx < KEYBOARD_MAP_SIZE &&
++        (kp->logic.custom_flags[idx] & 6) != 0) {
++      return false;  // mapped to an Apple key: no character is latched
++    }
++  }
++
++  uint32_t key = ev->key;
++  if (key >= kp_const::positional_threshold) {
++    key = keyboard_map_positional(kp, key, ev->mod_shift != 0U,
++                                  ev->mod_ctrl != 0U);
++  } else if (key >= 0x100) {
++    key = keyboard_map_symbolic(key);
++  } else if (key != 0) {
++    key = keyboard_apply_symbolic_shift(
++        key, ev->mod_shift != 0U, ev->mod_ctrl != 0U, kp->logic.caps_lock);
++  }
++
++  if (key > kp_const::key_code_mask) {
++    return false;
++  }
++  *out = key;
++  return true;
++}
++
+ auto keyboard_abi_command(void* instance, uint32_t cmd_id, const void* data,
+                           size_t size) -> PeripheralStatus_t {
+   if (instance == nullptr || (size > 0 && data == nullptr)) {
+@@ -491,18 +529,8 @@ auto keyboard_abi_command(void* instance, uint32_t cmd_id, const void* data,
+         }
+       }
+ 
+-      uint32_t key = ev->key;
+-      if (key >= kp_const::positional_threshold) {
+-        key = keyboard_map_positional(kp, key, ev->mod_shift != 0U,
+-                                      ev->mod_ctrl != 0U);
+-      } else if (key >= 0x100) {
+-        key = keyboard_map_symbolic(key);
+-      } else if (key != 0) {
+-        key = keyboard_apply_symbolic_shift(
+-            key, ev->mod_shift != 0U, ev->mod_ctrl != 0U, kp->logic.caps_lock);
+-      }
+-
+-      if (key > kp_const::key_code_mask) {
++      uint32_t key = 0;
++      if (!keyboard_translate_key(kp, ev, &key)) {
+         return peripheral_ok;
+       }
+ 
+@@ -705,6 +733,22 @@ auto keyboard_abi_query(void* instance, uint32_t cmd_id, void* out,
+       *out_size = sizeof(KeyboardModifiers_t);
+       return peripheral_ok;
+     }
++    case keyboard_query_translate: {
++      if (out == nullptr) {
++        *out_size = sizeof(KeyboardTranslate_t);
++        return peripheral_ok;
++      }
++      if (*out_size < sizeof(KeyboardTranslate_t)) {
++        return peripheral_error;
++      }
++      auto* request = static_cast<KeyboardTranslate_t*>(out);
++      uint32_t key = 0;
++      request->latched =
++          keyboard_translate_key(kp, &request->event, &key) ? 1U : 0U;
++      request->key = key;
++      *out_size = sizeof(KeyboardTranslate_t);
++      return peripheral_ok;
++    }
+     case keyboard_query_rocker: {
+       if (out == nullptr) {
+         *out_size = sizeof(uint8_t);
+diff --git a/src/apple2/peripherals/keyboard/KeyboardCommands.h b/src/apple2/peripherals/keyboard/KeyboardCommands.h
+index 97693ca..e4bb5a2 100644
+--- a/src/apple2/peripherals/keyboard/KeyboardCommands.h
++++ b/src/apple2/peripherals/keyboard/KeyboardCommands.h
+@@ -43,8 +43,9 @@ typedef enum {
+ } KeyboardCmd_t;
+ 
+ typedef enum {
+-  keyboard_query_mods = 0x0001,  /**< out: KeyboardModifiers_t */
+-  keyboard_query_rocker = 0x0002 /**< out: uint8_t (0=off, 1=on) */
++  keyboard_query_mods = 0x0001,     /**< out: KeyboardModifiers_t */
++  keyboard_query_rocker = 0x0002,   /**< out: uint8_t (0=off, 1=on) */
++  keyboard_query_translate = 0x0003 /**< in/out: KeyboardTranslate_t */
+ } KeyboardQuery_t;
+ 
+ typedef struct {
+@@ -66,6 +67,21 @@ typedef struct {
+   uint8_t reserved[3]; /**< Padding for 12-byte ABI alignment */
+ } KeyboardEvent_t;
+ 
++/** What a key event would turn into, without pressing anything.
++ *
++ * The caller fills in `event` exactly as it would send it and reads back the
++ * byte the machine would latch. Only the keyboard can answer this: the layout,
++ * the custom maps and the caps-lock state all live here, which is why a
++ * frontend that wants to log what a person typed has to ask rather than work
++ * it out for itself.
++ */
++typedef struct {
++  KeyboardEvent_t event; /**< in: the event as it would be sent */
++  uint32_t key;          /**< out: the byte the keyboard would latch */
++  uint8_t latched; /**< out: 0 when the key reaches the machine as nothing */
++  uint8_t reserved[3]; /**< Padding for 8-byte ABI alignment */
++} KeyboardTranslate_t;
++
+ typedef struct {
+   uint32_t scancode;
+   uint8_t normal_val;
+diff --git a/src/core/LinAppleCore.cpp b/src/core/LinAppleCore.cpp
+index 8e89960..a542b95 100644
+--- a/src/core/LinAppleCore.cpp
++++ b/src/core/LinAppleCore.cpp
+@@ -445,9 +445,23 @@ auto linapple_set_apple_key(int key, bool down) -> void {
+   peripheral_command(0, keyboard_cmd_set_mods, &mods, sizeof(mods));
+ }
+ 
++// Both callers mean "the stick is here now", which is JOY_CMD_SET_AXIS. This
++// used to drive JOY_CMD_SET_TRIM instead — the calibration offset a user nudges
++// once and leaves alone. Trim is shared by both sticks and has only an x and a
++// y, so the second joystick's axes folded onto the first one's, and a caller's
++// value landed as an offset from the resting 127 rather than a position.
++//
++// Axes are numbered the way the paddle registers are: 0 and 1 are the first
++// stick's x and y, 2 and 3 the second stick's.
+ auto linapple_set_joystick_axis(int axis, int value) -> void {
+-  JoystickTrimPayload_t payload = {axis == 0, static_cast<int16_t>(value)};
+-  peripheral_command(0, JOY_CMD_SET_TRIM, &payload, sizeof(payload));
++  if (axis < 0 || axis > 3) {
++    return;
++  }
++  const int position = (value < 0) ? 0 : ((value > 255) ? 255 : value);
++  JoystickAxisPayload_t payload = {static_cast<uint8_t>(axis >> 1),
++                                   static_cast<uint8_t>(axis & 1),
++                                   static_cast<uint8_t>(position)};
++  peripheral_command(0, JOY_CMD_SET_AXIS, &payload, sizeof(payload));
+ }
+ 
+ auto linapple_set_joystick_button(int button, bool down) -> void {
+diff --git a/src/frontends/common/AppArgs.cpp b/src/frontends/common/AppArgs.cpp
+index 0e76290..721816d 100644
+--- a/src/frontends/common/AppArgs.cpp
++++ b/src/frontends/common/AppArgs.cpp
+@@ -26,8 +26,9 @@ static constexpr int opt_basic_sync = 0x105;
+ static constexpr int opt_basic_line_mode = 0x106;
+ static constexpr int opt_caps_mode = 0x107;
+ static constexpr int opt_tui_render = 0x108;
++static constexpr int opt_agent_socket = 0x109;
+ 
+-static const std::array<struct option, 30> OptionTable = {
++static const std::array<struct option, 31> OptionTable = {
+     {{"d1", required_argument, nullptr, '1'},
+      {"d2", required_argument, nullptr, '2'},
+      {"hd1", required_argument, nullptr, opt_hd1},
+@@ -57,6 +58,7 @@ static const std::array<struct option, 30> OptionTable = {
+      {"basic-line-mode", required_argument, nullptr, opt_basic_line_mode},
+      {"caps-mode", required_argument, nullptr, opt_caps_mode},
+      {"tui-render", required_argument, nullptr, opt_tui_render},
++     {"agent-socket", required_argument, nullptr, opt_agent_socket},
+      {nullptr, 0, nullptr, 0}}};
+ 
+ static const char* OptString = "1:2:abc:fhlmpP:R:s:vx:T:X:6CA:";
+@@ -111,6 +113,9 @@ void app_args_print_help() {
+       "  --tui-render <mode>    Set TUI graphics render mode: smart (default) "
+       "or "
+       "block\n");
++  printf(
++      "  --agent-socket <path>  Listen for tool-assistant commands on a Unix "
++      "socket\n");
+ 
+   printf("\nBuilt-in System ROMs:\n");
+ #if ENABLE_ROM_APPLE2
+@@ -278,6 +283,10 @@ auto app_args_parse(int argc, char** argv, AppConfig_t* outConfig) -> int {
+           outConfig->caps_lock_mode = CAPS_MODE_HOST;
+         }
+         break;
++      case opt_agent_socket:
++        util_safe_strcpy(outConfig->agent_socket_path.data(), optarg,
++                         path_max_len);
++        break;
+       case opt_tui_render:
+         if (optarg != nullptr) {
+           if (std::strcmp(optarg, "block") == 0 ||
+diff --git a/src/frontends/common/AppConfig.h b/src/frontends/common/AppConfig.h
+index 940655e..857c292 100644
+--- a/src/frontends/common/AppConfig.h
++++ b/src/frontends/common/AppConfig.h
+@@ -27,6 +27,7 @@ struct AppConfig_t {
+   std::array<char, path_max_len> snapshot_path = {};
+   std::array<char, path_max_len> audio_dump_path = {};
+   std::array<char, path_max_len> rom_path = {};
++  std::array<char, path_max_len> agent_socket_path = {};
+ 
+   eApple2Type apple2_type = A2TYPE_APPLE2EENHANCED;
+   bool apple2_type_explicit = false;
+diff --git a/src/frontends/common/AudioDumper.cpp b/src/frontends/common/AudioDumper.cpp
+index 1e66aaf..cbeef3b 100644
+--- a/src/frontends/common/AudioDumper.cpp
++++ b/src/frontends/common/AudioDumper.cpp
+@@ -8,6 +8,8 @@
+ #include <mutex>
+ #include <utility>
+ 
++#include "frontends/common/Frontend.h"
++
+ namespace {
+ 
+ constexpr uint32_t fmt_chunk_size = 16;
+@@ -230,3 +232,17 @@ auto audio_dumper_finalize(AudioDumper_t* dumper) -> int {
+   dumper->finalize();
+   return 0;
+ }
++
++// Frontends that have no audio path of their own keep these. Saying no here is
++// better than writing an empty WAV: a caller that asked to record and got
++// silence has no way to tell that from a machine that made no sound.
++#define WEAK __attribute__((weak))
++
++WEAK auto frontend_audio_dump_start(const char* path) -> bool {
++  (void)path;
++  return false;
++}
++
++WEAK auto frontend_audio_dump_stop() -> void {}
++
++WEAK auto frontend_audio_dump_path() -> const char* { return ""; }
+diff --git a/src/frontends/common/Frontend.h b/src/frontends/common/Frontend.h
+index ac530d2..6e32a03 100644
+--- a/src/frontends/common/Frontend.h
++++ b/src/frontends/common/Frontend.h
+@@ -29,6 +29,15 @@ auto frontend_dispatch_key_event(uint32_t scancode, uint32_t keycode,
+                                  uint32_t mod, bool is_down) -> void;
+ auto frontend_to_core_key(int key, uint32_t mod) -> LinAppleKey;
+ 
++// Recording the machine's sound to a WAV file, started and stopped while it
++// runs rather than only from the command line. A frontend that has somewhere
++// to take the samples from implements these; the rest keep the weak defaults
++// in AudioDumper.cpp, which answer that this one cannot record.
++auto frontend_audio_dump_start(const char* path) -> bool;
++auto frontend_audio_dump_stop() -> void;
++// The file being written, or an empty string when nothing is being recorded.
++auto frontend_audio_dump_path() -> const char*;
++
+ // Constants
+ constexpr int window_width = SCREEN_WIDTH;
+ constexpr int window_height = SCREEN_HEIGHT;
+diff --git a/src/frontends/common/agent/AgentCommands.cpp b/src/frontends/common/agent/AgentCommands.cpp
+new file mode 100644
+index 0000000..d8560cc
+--- /dev/null
++++ b/src/frontends/common/agent/AgentCommands.cpp
+@@ -0,0 +1,932 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "frontends/common/agent/AgentCommands.h"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <nlohmann/json.hpp>
++#include <nlohmann/json_fwd.hpp>
++#include <string>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#include "apple2/CPU.h"
++#include "apple2/Memory.h"
++#include "apple2/Video.h"
++#include "apple2/peripherals/disk/DiskCommands.h"
++#include "core/LinAppleCore.h"
++#include "core/Peripheral.h"
++#include "core/Peripheral_Types.h"
++#include "frontends/common/Frontend.h"
++#include "frontends/common/SaveStateManager.h"
++#include "frontends/common/agent/AgentInput.h"
++
++namespace {
++
++using Json = nlohmann::json;
++
++constexpr int agent_protocol_version = 1;
++constexpr uint32_t apple2_frame_cycles = 17030;
++constexpr uint32_t max_step_frames = 60 * 60 * 10;
++constexpr size_t max_mem_read_len = 0x10000;
++constexpr int64_t max_input_capture_limit = 1 << 20;
++constexpr int text_cols_40 = 40;
++constexpr int text_cols_80 = 80;
++constexpr int text_row_count = 24;
++constexpr uint16_t text_page1_base = 0x0400;
++constexpr uint16_t text_page2_offset = 0x0400;
++constexpr uint16_t hires_page1_base = 0x2000;
++constexpr uint16_t hires_page2_base = 0x4000;
++constexpr size_t hires_page_size = 0x2000;
++
++constexpr const char* base64_alphabet =
++    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++auto base64_encode(const uint8_t* data, size_t size) -> std::string {
++  std::string out;
++  out.reserve(((size + 2) / 3) * 4);
++  size_t i = 0;
++  while (i + 2 < size) {
++    const uint32_t triple = (static_cast<uint32_t>(data[i]) << 16) |
++                            (static_cast<uint32_t>(data[i + 1]) << 8) |
++                            static_cast<uint32_t>(data[i + 2]);
++    out.push_back(base64_alphabet[(triple >> 18) & 0x3F]);
++    out.push_back(base64_alphabet[(triple >> 12) & 0x3F]);
++    out.push_back(base64_alphabet[(triple >> 6) & 0x3F]);
++    out.push_back(base64_alphabet[triple & 0x3F]);
++    i += 3;
++  }
++  if (i < size) {
++    uint32_t triple = static_cast<uint32_t>(data[i]) << 16;
++    const bool has_second = (i + 1) < size;
++    if (has_second) {
++      triple |= static_cast<uint32_t>(data[i + 1]) << 8;
++    }
++    out.push_back(base64_alphabet[(triple >> 18) & 0x3F]);
++    out.push_back(base64_alphabet[(triple >> 12) & 0x3F]);
++    out.push_back(has_second ? base64_alphabet[(triple >> 6) & 0x3F] : '=');
++    out.push_back('=');
++  }
++  return out;
++}
++
++auto base64_decode_char(char c) -> int {
++  if (c >= 'A' && c <= 'Z') return c - 'A';
++  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
++  if (c >= '0' && c <= '9') return c - '0' + 52;
++  if (c == '+') return 62;
++  if (c == '/') return 63;
++  return -1;
++}
++
++auto base64_decode(const std::string& text, std::vector<uint8_t>* out) -> bool {
++  uint32_t accumulator = 0;
++  int bits = 0;
++  for (const char c : text) {
++    if (c == '=' || c == '\n' || c == '\r') {
++      continue;
++    }
++    const int value = base64_decode_char(c);
++    if (value < 0) {
++      return false;
++    }
++    accumulator = (accumulator << 6) | static_cast<uint32_t>(value);
++    bits += 6;
++    if (bits >= 8) {
++      bits -= 8;
++      out->push_back(static_cast<uint8_t>((accumulator >> bits) & 0xFF));
++    }
++  }
++  return true;
++}
++
++auto make_ok(const Json& request, Json result) -> std::string {
++  Json response;
++  response["id"] = request.contains("id") ? request.at("id") : Json(nullptr);
++  response["ok"] = true;
++  response["result"] = std::move(result);
++  return response.dump();
++}
++
++auto make_error(const Json& request, const std::string& message)
++    -> std::string {
++  Json response;
++  response["id"] = request.contains("id") ? request.at("id") : Json(nullptr);
++  response["ok"] = false;
++  response["error"] = message;
++  return response.dump();
++}
++
++auto param_int(const Json& params, const char* key, int64_t fallback)
++    -> int64_t {
++  if (!params.contains(key) || !params.at(key).is_number()) {
++    return fallback;
++  }
++  return params.at(key).get<int64_t>();
++}
++
++auto param_bool(const Json& params, const char* key, bool fallback) -> bool {
++  if (!params.contains(key) || !params.at(key).is_boolean()) {
++    return fallback;
++  }
++  return params.at(key).get<bool>();
++}
++
++auto param_string(const Json& params, const char* key) -> std::string {
++  if (!params.contains(key) || !params.at(key).is_string()) {
++    return {};
++  }
++  return params.at(key).get<std::string>();
++}
++
++// --- run control -----------------------------------------------------------
++
++// Runs exactly `frames` emulated frames and parks the machine again. Turbo and
++// the disk-driven full-speed path both multiply the cycles a single
++// linapple_run_frame() call consumes, so deterministic stepping disables them
++// for the duration and restores the caller's settings afterwards.
++auto step_frames(uint32_t frames, bool deterministic) -> uint64_t {
++  const AppMode_t saved_mode = g_state.mode;
++  const bool saved_turbo = linapple_get_turbo();
++  const uint32_t saved_precision = g_state.needsprecision;
++
++  if (deterministic) {
++    linapple_set_turbo(false);
++    g_state.needsprecision = 1;
++  }
++  g_state.mode = MODE_RUNNING;
++
++  uint64_t executed = 0;
++  for (uint32_t i = 0; i < frames; ++i) {
++    executed += linapple_run_frame(apple2_frame_cycles);
++  }
++
++  g_state.mode = (saved_mode == MODE_EXIT) ? MODE_EXIT : MODE_PAUSED;
++  if (deterministic) {
++    linapple_set_turbo(saved_turbo);
++    g_state.needsprecision = saved_precision;
++  }
++  return executed;
++}
++
++auto mode_name(AppMode_t mode) -> const char* {
++  switch (mode) {
++    case MODE_LOGO:
++      return "logo";
++    case MODE_PAUSED:
++      return "paused";
++    case MODE_RUNNING:
++      return "running";
++    case MODE_DEBUG:
++      return "debug";
++    case MODE_STEPPING:
++      return "stepping";
++    case MODE_DISK_CHOOSE:
++      return "disk_choose";
++    case MODE_EXIT:
++      return "exit";
++  }
++  return "unknown";
++}
++
++// --- screen ----------------------------------------------------------------
++
++auto text_row_offset(int row) -> uint16_t {
++  static constexpr std::array<uint16_t, text_row_count> offsets = {
++      0x000, 0x080, 0x100, 0x180, 0x200, 0x280, 0x300, 0x380,
++      0x028, 0x0A8, 0x128, 0x1A8, 0x228, 0x2A8, 0x328, 0x3A8,
++      0x050, 0x0D0, 0x150, 0x1D0, 0x250, 0x2D0, 0x350, 0x3D0};
++  return offsets.at(static_cast<size_t>(row));
++}
++
++// Maps a screen-code byte to printable ASCII. Inverse and flashing cells differ
++// only in their high bits, which carry no textual meaning for a reader.
++auto screen_code_to_ascii(uint8_t code, bool alt_charset) -> char {
++  uint8_t ascii = 0;
++  if (code >= 0x80) {
++    ascii = code & 0x7F;
++  } else if (code >= 0x40) {
++    ascii = alt_charset ? code : static_cast<uint8_t>(code - 0x40);
++  } else {
++    ascii = code;
++  }
++  if (ascii < 0x20) {
++    ascii = static_cast<uint8_t>(ascii + 0x40);
++  }
++  if (ascii == 0x7F) {
++    ascii = ' ';
++  }
++  return static_cast<char>(ascii);
++}
++
++auto read_text_screen() -> Json {
++  const bool is_80col = video_get_sw_80col();
++  const bool alt_charset = video_get_sw_alt_charset();
++  const uint16_t page_offset = video_get_sw_page2() ? text_page2_offset : 0;
++  const int columns = is_80col ? text_cols_80 : text_cols_40;
++
++  Json lines = Json::array();
++  for (int row = 0; row < text_row_count; ++row) {
++    std::string line;
++    line.reserve(static_cast<size_t>(columns));
++    for (int col = 0; col < columns; ++col) {
++      const uint16_t addr = static_cast<uint16_t>(
++          text_page1_base + page_offset + text_row_offset(row) +
++          (is_80col ? (col / 2) : col));
++      const uint8_t* cell = (is_80col && (col % 2) == 0)
++                                ? mem_get_aux_ptr(addr)
++                                : mem_get_main_ptr(addr);
++      line.push_back(cell != nullptr ? screen_code_to_ascii(*cell, alt_charset)
++                                     : ' ');
++    }
++    lines.push_back(line);
++  }
++
++  Json result;
++  result["columns"] = columns;
++  result["rows"] = text_row_count;
++  result["lines"] = std::move(lines);
++  result["text_mode"] = video_get_sw_text();
++  result["mixed"] = video_get_sw_mixed();
++  return result;
++}
++
++auto capture_screen() -> Json {
++  const uint32_t* pixels = video_get_output_buffer();
++  Json result;
++  result["width"] = video_width;
++  result["height"] = video_height;
++  result["format"] = "bgra8888";
++  if (pixels == nullptr) {
++    result["data"] = "";
++    return result;
++  }
++  const size_t byte_count =
++      static_cast<size_t>(video_width) * video_height * sizeof(uint32_t);
++  result["data"] =
++      base64_encode(reinterpret_cast<const uint8_t*>(pixels), byte_count);
++  return result;
++}
++
++constexpr uint64_t fnv_offset = 1469598103934665603ULL;
++constexpr uint64_t fnv_prime = 1099511628211ULL;
++
++// FNV-1a over the active hi-res page. A client watching for the screen to
++// change needs only to know whether it did, and shipping 8 KB per check turns
++// a wait into a storm of round trips.
++auto hires_page_hash(bool page2) -> uint64_t {
++  // Every byte, not a sample of them. Hashing 8 KB costs microseconds against
++  // the ten million cycles a wait emulates between checks, and sampling would
++  // miss a single changed character — which a caller reading the screen as
++  // text very much cares about, and which lets a cached decode go stale.
++  const uint16_t base = page2 ? hires_page2_base : hires_page1_base;
++  const uint8_t* page = mem_get_main_ptr(base);
++  if (page == nullptr) {
++    return 0;
++  }
++  uint64_t hash = fnv_offset;
++  for (size_t i = 0; i < hires_page_size; ++i) {
++    hash ^= static_cast<uint64_t>(page[i]);
++    hash *= fnv_prime;
++  }
++  return hash;
++}
++
++// The same idea over the visible text cells. Only the cells are hashed, using
++// the same addressing as read_text_screen: the 64 bytes of screen holes the
++// rows skip belong to peripherals as scratch, and their churn would keep a
++// wait from ever settling.
++auto text_page_hash(bool page2) -> uint64_t {
++  const bool is_80col = video_get_sw_80col();
++  const uint16_t page_offset = page2 ? text_page2_offset : 0;
++  const int columns = is_80col ? text_cols_80 : text_cols_40;
++
++  uint64_t hash = fnv_offset;
++  for (int row = 0; row < text_row_count; ++row) {
++    for (int col = 0; col < columns; ++col) {
++      const uint16_t addr = static_cast<uint16_t>(
++          text_page1_base + page_offset + text_row_offset(row) +
++          (is_80col ? (col / 2) : col));
++      const uint8_t* cell = (is_80col && (col % 2) == 0)
++                                ? mem_get_aux_ptr(addr)
++                                : mem_get_main_ptr(addr);
++      hash ^= static_cast<uint64_t>(cell != nullptr ? *cell : 0);
++      hash *= fnv_prime;
++    }
++  }
++  return hash;
++}
++
++// Which page a caller means by "the screen" depends on what the machine is
++// displaying. A game drawing its own font into hi-res leaves the text page
++// untouched, and a game using the hardware text page never touches hi-res —
++// watching the wrong one reports "nothing changed" until the frame budget runs
++// out. Mixed mode stays on hi-res deliberately: hi-res games treat the text
++// page as scratch RAM, so folding it in would mean a screen that never settles.
++auto screen_page_hash() -> uint64_t {
++  const bool page2 = video_get_sw_page2();
++  return video_get_sw_text() ? text_page_hash(page2) : hires_page_hash(page2);
++}
++
++// --- disk ------------------------------------------------------------------
++
++auto query_disk_status(DiskStatus_t* status) -> bool {
++  size_t size = sizeof(DiskStatus_t);
++  return peripheral_query(disk_default_slot, disk_query_status, status,
++                          &size) == peripheral_ok;
++}
++
++auto disk_status_json() -> Json {
++  DiskStatus_t status = {};
++  Json result;
++  if (!query_disk_status(&status)) {
++    result["drives"] = Json::array();
++    return result;
++  }
++  Json drives = Json::array();
++  Json drive0;
++  drive0["drive"] = 0;
++  drive0["loaded"] = status.drive0_loaded != 0;
++  drive0["spinning"] = status.drive0_spinning != 0;
++  drive0["writing"] = status.drive0_writing != 0;
++  drive0["write_protected"] = status.drive0_write_protected != 0;
++  drive0["name"] = std::string(status.drive0_name);
++  drive0["path"] = std::string(status.drive0_full_path);
++  drive0["last_error"] = status.drive0_last_error;
++  drives.push_back(std::move(drive0));
++  Json drive1;
++  drive1["drive"] = 1;
++  drive1["loaded"] = status.drive1_loaded != 0;
++  drive1["spinning"] = status.drive1_spinning != 0;
++  drive1["writing"] = status.drive1_writing != 0;
++  drive1["write_protected"] = status.drive1_write_protected != 0;
++  drive1["name"] = std::string(status.drive1_name);
++  drive1["path"] = std::string(status.drive1_full_path);
++  drive1["last_error"] = status.drive1_last_error;
++  drives.push_back(std::move(drive1));
++  result["drives"] = std::move(drives);
++  return result;
++}
++
++// --- command table ---------------------------------------------------------
++
++const std::array<const char*, 24> command_names = {
++    "ping",     "version",     "commands",   "status",     "key_press",
++    "key_type", "key_state",   "joy_axis",   "joy_button", "run_frames",
++    "pause",    "resume",      "reset",      "speed_set",  "turbo_set",
++    "quit",     "disk_insert", "disk_eject", "disk_swap",  "disk_status",
++    "mem_read", "mem_write",   "cpu_regs",   "screen_text"};
++
++auto dispatch(const std::string& cmd, const Json& params, const Json& request)
++    -> std::string {
++  if (cmd == "ping") {
++    return make_ok(request, Json::object());
++  }
++
++  if (cmd == "version") {
++    Json result;
++    result["protocol"] = agent_protocol_version;
++    result["emulator"] = "linapple";
++#ifdef LINAPPLE_FRONTEND_NAME
++    result["frontend"] = LINAPPLE_FRONTEND_NAME;
++#endif
++    return make_ok(request, result);
++  }
++
++  if (cmd == "commands") {
++    Json names = Json::array();
++    for (const char* name : command_names) {
++      names.push_back(name);
++    }
++    names.push_back("screen_hires");
++    names.push_back("screen_hash");
++    names.push_back("run_until_change");
++    names.push_back("screen_capture");
++    names.push_back("state_save");
++    names.push_back("state_load");
++    names.push_back("input_capture");
++    names.push_back("input_poll");
++    names.push_back("audio_dump");
++    Json result;
++    result["commands"] = std::move(names);
++    return make_ok(request, result);
++  }
++
++  if (cmd == "status") {
++    Json result;
++    result["mode"] = mode_name(g_state.mode);
++    result["speed"] = linapple_get_speed();
++    result["turbo"] = linapple_get_turbo();
++    result["cycles"] = cpu_get_cumulative_cycles();
++    result["text_mode"] = video_get_sw_text();
++    result["hires"] = video_get_sw_hires();
++    result["col80"] = video_get_sw_80col();
++    result["mixed"] = video_get_sw_mixed();
++    result["page2"] = video_get_sw_page2();
++    result["alt_charset"] = video_get_sw_alt_charset();
++    return make_ok(request, result);
++  }
++
++  if (cmd == "key_press") {
++    const int64_t key = param_int(params, "key", -1);
++    if (key < 0 || key > 0xFF) {
++      return make_error(request, "key must be an Apple II code in 0..255");
++    }
++    const auto code = static_cast<uint8_t>(key);
++    linapple_set_key_state(code, true);
++    linapple_set_key_state(code, false);
++    return make_ok(request, Json::object());
++  }
++
++  if (cmd == "key_state") {
++    const int64_t key = param_int(params, "key", -1);
++    if (key < 0 || key > 0xFF) {
++      return make_error(request, "key must be an Apple II code in 0..255");
++    }
++    linapple_set_key_state(static_cast<uint8_t>(key),
++                           param_bool(params, "down", true));
++    return make_ok(request, Json::object());
++  }
++
++  if (cmd == "key_type") {
++    const std::string text = param_string(params, "text");
++    if (text.empty()) {
++      return make_error(request, "text is required");
++    }
++    // The Apple II keyboard is a single-byte latch: a character pushed before
++    // the running program has read the previous one is simply lost. Running
++    // the gap *before* each key, rather than after, also covers the first
++    // character, which would otherwise land on whatever the machine was still
++    // holding when the command arrived.
++    const int64_t frames_between = param_int(params, "frames_between", 3);
++    for (const char c : text) {
++      if (frames_between > 0) {
++        step_frames(static_cast<uint32_t>(frames_between), false);
++      }
++      const auto code = static_cast<uint8_t>(c);
++      linapple_set_key_state(code, true);
++      linapple_set_key_state(code, false);
++    }
++    if (frames_between > 0) {
++      step_frames(static_cast<uint32_t>(frames_between), false);
++    }
++    Json result;
++    result["typed"] = text.size();
++    return make_ok(request, result);
++  }
++
++  if (cmd == "joy_axis") {
++    const int64_t axis = param_int(params, "axis", -1);
++    if (axis < 0 || axis > 3) {
++      return make_error(request, "axis must be in 0..3");
++    }
++    // An absolute paddle position, not a nudge: 0 and 255 are the ends of
++    // travel and 127 is the stick at rest. Silently centring an absent value
++    // would look like a stick that moved on its own.
++    const int64_t value = param_int(params, "value", -1);
++    if (value < 0 || value > 0xFF) {
++      return make_error(request, "value must be a paddle position in 0..255");
++    }
++    linapple_set_joystick_axis(static_cast<int>(axis), static_cast<int>(value));
++    return make_ok(request, Json::object());
++  }
++
++  if (cmd == "joy_button") {
++    // Three pushbuttons, at $C061 through $C063. A fourth was accepted here
++    // and then dropped by the peripheral, which answered ok for a press that
++    // never happened.
++    const int64_t button = param_int(params, "button", -1);
++    if (button < 0 || button > 2) {
++      return make_error(request, "button must be in 0..2");
++    }
++    linapple_set_joystick_button(static_cast<int>(button),
++                                 param_bool(params, "down", false));
++    return make_ok(request, Json::object());
++  }
++
++  if (cmd == "run_frames") {
++    const int64_t frames = param_int(params, "frames", 1);
++    if (frames < 0 || static_cast<uint64_t>(frames) > max_step_frames) {
++      return make_error(request, "frames out of range");
++    }
++    const uint64_t executed =
++        step_frames(static_cast<uint32_t>(frames),
++                    param_bool(params, "deterministic", true));
++    Json result;
++    result["frames"] = frames;
++    result["cycles"] = executed;
++    result["mode"] = mode_name(g_state.mode);
++    return make_ok(request, result);
++  }
++
++  if (cmd == "pause") {
++    g_state.mode = MODE_PAUSED;
++    return make_ok(request, Json::object());
++  }
++
++  if (cmd == "resume") {
++    g_state.mode = MODE_RUNNING;
++    return make_ok(request, Json::object());
++  }
++
++  if (cmd == "reset") {
++    if (param_bool(params, "full", false)) {
++      linapple_reset_hard();
++    } else {
++      linapple_reset_soft();
++    }
++    return make_ok(request, Json::object());
++  }
++
++  if (cmd == "speed_set") {
++    const int64_t speed = param_int(params, "speed", SPEED_NORMAL);
++    if (speed < SPEED_MIN || speed > emulation_speed_max) {
++      return make_error(request, "speed out of range");
++    }
++    linapple_set_speed(static_cast<uint32_t>(speed));
++    Json result;
++    result["speed"] = linapple_get_speed();
++    return make_ok(request, result);
++  }
++
++  if (cmd == "turbo_set") {
++    linapple_set_turbo(param_bool(params, "turbo", false));
++    Json result;
++    result["turbo"] = linapple_get_turbo();
++    return make_ok(request, result);
++  }
++
++  if (cmd == "quit") {
++    g_state.mode = MODE_EXIT;
++    return make_ok(request, Json::object());
++  }
++
++  if (cmd == "disk_insert") {
++    const std::string path = param_string(params, "path");
++    const int64_t drive = param_int(params, "drive", -1);
++    if (path.empty()) {
++      return make_error(request, "path is required");
++    }
++    if (drive != 0 && drive != 1) {
++      return make_error(request, "drive must be 0 or 1");
++    }
++    if (path.size() >= disk_insert_path_max) {
++      return make_error(request, "path too long");
++    }
++    DiskInsertCmd_t insert = {};
++    std::memcpy(static_cast<void*>(insert.path), path.c_str(), path.size() + 1);
++    insert.drive = static_cast<uint8_t>(drive);
++    insert.write_protected =
++        param_bool(params, "write_protected", false) ? 1 : 0;
++    insert.create_if_necessary = 0;
++    const PeripheralStatus_t status = peripheral_command(
++        disk_default_slot, disk_cmd_insert, &insert, sizeof(insert));
++    if (status != peripheral_ok) {
++      return make_error(request, "disk_insert failed");
++    }
++    return make_ok(request, disk_status_json());
++  }
++
++  if (cmd == "disk_eject") {
++    const int64_t drive = param_int(params, "drive", -1);
++    if (drive != 0 && drive != 1) {
++      return make_error(request, "drive must be 0 or 1");
++    }
++    DiskEjectCmd_t eject = {};
++    eject.drive = static_cast<uint8_t>(drive);
++    if (peripheral_command(disk_default_slot, disk_cmd_eject, &eject,
++                           sizeof(eject)) != peripheral_ok) {
++      return make_error(request, "disk_eject failed");
++    }
++    return make_ok(request, disk_status_json());
++  }
++
++  if (cmd == "disk_swap") {
++    if (peripheral_command(disk_default_slot, disk_cmd_swap_drives, nullptr,
++                           0) != peripheral_ok) {
++      return make_error(request, "disk_swap failed");
++    }
++    return make_ok(request, disk_status_json());
++  }
++
++  if (cmd == "disk_status") {
++    return make_ok(request, disk_status_json());
++  }
++
++  if (cmd == "mem_read") {
++    const int64_t addr = param_int(params, "addr", -1);
++    const int64_t len = param_int(params, "len", 1);
++    if (addr < 0 || addr > 0xFFFF) {
++      return make_error(request, "addr must be in 0..65535");
++    }
++    if (len <= 0 || static_cast<size_t>(len) > max_mem_read_len ||
++        (addr + len) > 0x10000) {
++      return make_error(request, "len out of range");
++    }
++    const bool aux = param_bool(params, "aux", false);
++    std::vector<uint8_t> buffer;
++    buffer.reserve(static_cast<size_t>(len));
++    for (int64_t i = 0; i < len; ++i) {
++      const auto address = static_cast<uint16_t>(addr + i);
++      const uint8_t* byte =
++          aux ? mem_get_aux_ptr(address) : mem_get_main_ptr(address);
++      buffer.push_back(byte != nullptr ? *byte : 0);
++    }
++    Json result;
++    result["addr"] = addr;
++    result["len"] = len;
++    result["data"] = base64_encode(buffer.data(), buffer.size());
++    return make_ok(request, result);
++  }
++
++  if (cmd == "mem_write") {
++    const int64_t addr = param_int(params, "addr", -1);
++    if (addr < 0 || addr > 0xFFFF) {
++      return make_error(request, "addr must be in 0..65535");
++    }
++    std::vector<uint8_t> bytes;
++    if (params.contains("data") && params.at("data").is_string()) {
++      if (!base64_decode(params.at("data").get<std::string>(), &bytes)) {
++        return make_error(request, "data is not valid base64");
++      }
++    } else if (params.contains("bytes") && params.at("bytes").is_array()) {
++      for (const Json& entry : params.at("bytes")) {
++        if (!entry.is_number()) {
++          return make_error(request, "bytes must contain numbers only");
++        }
++        bytes.push_back(static_cast<uint8_t>(entry.get<int64_t>() & 0xFF));
++      }
++    } else {
++      return make_error(request, "data or bytes is required");
++    }
++    if (bytes.empty() ||
++        (addr + static_cast<int64_t>(bytes.size())) > 0x10000) {
++      return make_error(request, "write range out of bounds");
++    }
++    const bool aux = param_bool(params, "aux", false);
++    for (size_t i = 0; i < bytes.size(); ++i) {
++      const auto address =
++          static_cast<uint16_t>(addr + static_cast<int64_t>(i));
++      uint8_t* target =
++          aux ? mem_get_aux_ptr(address) : mem_get_main_ptr(address);
++      if (target != nullptr) {
++        *target = bytes.at(i);
++      }
++    }
++    Json result;
++    result["written"] = bytes.size();
++    return make_ok(request, result);
++  }
++
++  if (cmd == "cpu_regs") {
++    const CpuRegisters_t* regs = cpu_get_registers();
++    if (regs == nullptr) {
++      return make_error(request, "cpu registers unavailable");
++    }
++    Json result;
++    result["a"] = regs->a;
++    result["x"] = regs->x;
++    result["y"] = regs->y;
++    result["pc"] = regs->pc;
++    result["sp"] = regs->sp;
++    result["ps"] = regs->ps;
++    result["cycles"] = cpu_get_cumulative_cycles();
++    return make_ok(request, result);
++  }
++
++  if (cmd == "screen_text") {
++    return make_ok(request, read_text_screen());
++  }
++
++  if (cmd == "screen_hash") {
++    Json result;
++    result["page"] = video_get_sw_page2() ? 2 : 1;
++    result["source"] = video_get_sw_text() ? "text" : "hires";
++    result["hash"] = screen_page_hash();
++    return make_ok(request, result);
++  }
++
++  if (cmd == "run_until_change") {
++    // Waiting for a game to redraw is a polling loop, and running it over the
++    // socket costs a round trip per sample — hundreds of wakeups for a single
++    // keypress, which shows up as a CPU held at its top clock while usage
++    // looks near idle. Running the loop here makes it one round trip.
++    const int64_t max_frames = param_int(params, "max_frames", 600);
++    const int64_t chunk = param_int(params, "chunk", 48);
++    const int64_t stable_target = param_int(params, "stable", 2);
++    if (max_frames < 0 || static_cast<uint64_t>(max_frames) > max_step_frames ||
++        chunk <= 0) {
++      return make_error(request, "max_frames or chunk out of range");
++    }
++
++    const uint64_t started_as = screen_page_hash();
++    uint64_t previous = started_as;
++    uint64_t executed = 0;
++    int64_t spent = 0;
++    int64_t stable = 0;
++    bool changed = false;
++
++    // Emulating flat out pins a core at its top clock. Resting in proportion
++    // to the work keeps a long wait from turning into a heat problem, and the
++    // pause is short enough that responsiveness is unaffected.
++    const int64_t duty_percent = std::min<int64_t>(
++        std::max<int64_t>(param_int(params, "duty", 60), 5), 100);
++
++    // A sub-millisecond sleep costs a wakeup and saves nothing — the core never
++    // reaches a deep idle state at that granularity, which is the pattern that
++    // shows up as a high clock under near-idle usage. Owe the rest instead and
++    // pay it once it is worth taking.
++    constexpr auto min_rest = std::chrono::milliseconds(1);
++    auto owed = std::chrono::nanoseconds::zero();
++
++    while (spent < max_frames) {
++      const auto chunk_started = std::chrono::steady_clock::now();
++      executed += step_frames(static_cast<uint32_t>(chunk), false);
++      spent += chunk;
++      if (duty_percent < 100) {
++        const auto worked = std::chrono::steady_clock::now() - chunk_started;
++        owed += std::chrono::duration_cast<std::chrono::nanoseconds>(
++            worked * (100 - duty_percent) / duty_percent);
++        if (owed >= min_rest) {
++          std::this_thread::sleep_for(owed);
++          owed = std::chrono::nanoseconds::zero();
++        }
++      }
++      const uint64_t current = screen_page_hash();
++      if (current != previous) {
++        changed = true;
++        stable = 0;
++        previous = current;
++        continue;
++      }
++      if (changed) {
++        ++stable;
++        if (stable >= stable_target) {
++          break;
++        }
++      }
++    }
++
++    Json result;
++    result["frames"] = spent;
++    result["cycles"] = executed;
++    result["changed"] = changed;
++    result["hash"] = previous;
++    result["mode"] = mode_name(g_state.mode);
++    return make_ok(request, result);
++  }
++
++  if (cmd == "screen_hires") {
++    // Games that draw their own text do it straight into the hi-res page, so
++    // handing back those 8 KB lets a client decode the screen itself without
++    // the cost of a full framebuffer capture.
++    const bool page2 = params.contains("page")
++                           ? param_int(params, "page", 1) == 2
++                           : video_get_sw_page2();
++    const uint16_t base = page2 ? hires_page2_base : hires_page1_base;
++    std::vector<uint8_t> buffer;
++    buffer.reserve(hires_page_size);
++    for (size_t i = 0; i < hires_page_size; ++i) {
++      const uint8_t* byte =
++          param_bool(params, "aux", false)
++              ? mem_get_aux_ptr(static_cast<uint16_t>(base + i))
++              : mem_get_main_ptr(static_cast<uint16_t>(base + i));
++      buffer.push_back(byte != nullptr ? *byte : 0);
++    }
++    Json result;
++    result["page"] = page2 ? 2 : 1;
++    result["addr"] = base;
++    result["len"] = hires_page_size;
++    result["hires"] = video_get_sw_hires();
++    result["mixed"] = video_get_sw_mixed();
++    result["data"] = base64_encode(buffer.data(), buffer.size());
++    return make_ok(request, result);
++  }
++
++  if (cmd == "screen_capture") {
++    return make_ok(request, capture_screen());
++  }
++
++  if (cmd == "input_capture") {
++    // A person playing at the window talks to the frontend, not to this
++    // socket, so their input would otherwise be invisible here. Capture is off
++    // until asked for: a session nobody is recording should not be keeping a
++    // buffer of keystrokes.
++    const bool on = param_bool(params, "on", true);
++    const int64_t limit = param_int(params, "limit", 0);
++    if (limit < 0 || limit > max_input_capture_limit) {
++      return make_error(request, "limit out of range");
++    }
++    agent_input_set_capture(on, static_cast<size_t>(limit));
++    Json result;
++    result["capturing"] = agent_input_capturing();
++    result["pending"] = agent_input_pending();
++    return make_ok(request, result);
++  }
++
++  if (cmd == "input_poll") {
++    const int64_t max_events = param_int(params, "max", 256);
++    if (max_events <= 0 || max_events > max_input_capture_limit) {
++      return make_error(request, "max out of range");
++    }
++    std::vector<AgentInputEvent_t> taken(static_cast<size_t>(max_events));
++    const size_t count =
++        agent_input_take(static_cast<size_t>(max_events), taken.data());
++    Json events = Json::array();
++    for (size_t i = 0; i < count; ++i) {
++      Json entry;
++      entry["cycles"] = taken.at(i).cycles;
++      entry["kind"] = taken.at(i).kind;
++      entry["code"] = taken.at(i).code;
++      entry["value"] = taken.at(i).value;
++      events.push_back(std::move(entry));
++    }
++    Json result;
++    result["events"] = std::move(events);
++    result["capturing"] = agent_input_capturing();
++    result["pending"] = agent_input_pending();
++    // Input the buffer had to throw away, so a recorder can say its movie is
++    // incomplete rather than quietly producing a shorter one.
++    result["dropped"] = agent_input_dropped();
++    result["cycles"] = cpu_get_cumulative_cycles();
++    return make_ok(request, result);
++  }
++
++  if (cmd == "audio_dump") {
++    // Recording the sound the machine makes, started and stopped on the wire
++    // so that it can be lined up with a replay rather than with the process.
++    // The headless frontend writes what the speaker produced, on emulated
++    // time - a movie replayed at ten times speed still comes out at the right
++    // pitch. The SDL frontends write the mixer's output instead.
++    const bool on = param_bool(params, "on", true);
++    const std::string path = param_string(params, "path");
++    if (on) {
++      if (path.empty()) {
++        return make_error(request, "path is required");
++      }
++      if (!frontend_audio_dump_start(path.c_str())) {
++        return make_error(request,
++                          "this frontend cannot record audio, or the file "
++                          "could not be opened");
++      }
++    } else {
++      frontend_audio_dump_stop();
++    }
++    Json result;
++    const std::string active = frontend_audio_dump_path();
++    result["dumping"] = !active.empty();
++    result["path"] = active;
++    return make_ok(request, result);
++  }
++
++  if (cmd == "state_save") {
++    const std::string path = param_string(params, "path");
++    if (!path.empty()) {
++      save_state_set_filename(path.c_str());
++    }
++    save_state_save();
++    Json result;
++    result["path"] = std::string(save_state_get_filename());
++    return make_ok(request, result);
++  }
++
++  if (cmd == "state_load") {
++    const std::string path = param_string(params, "path");
++    if (!path.empty()) {
++      save_state_set_filename(path.c_str());
++    }
++    save_state_load();
++    Json result;
++    result["path"] = std::string(save_state_get_filename());
++    return make_ok(request, result);
++  }
++
++  return make_error(request, "unknown command: " + cmd);
++}
++
++}  // namespace
++
++auto agent_command_dispatch(const std::string& request_line) -> std::string {
++  Json request = Json::object();
++  Json parsed = Json::parse(request_line, nullptr, false);
++  if (parsed.is_discarded() || !parsed.is_object()) {
++    return make_error(request, "malformed JSON request");
++  }
++  request = std::move(parsed);
++
++  if (!request.contains("cmd") || !request.at("cmd").is_string()) {
++    return make_error(request, "cmd is required");
++  }
++  const auto cmd = request.at("cmd").get<std::string>();
++
++  Json params = Json::object();
++  if (request.contains("params") && request.at("params").is_object()) {
++    params = request.at("params");
++  }
++
++  return dispatch(cmd, params, request);
++}
+diff --git a/src/frontends/common/agent/AgentCommands.h b/src/frontends/common/agent/AgentCommands.h
+new file mode 100644
+index 0000000..b66bd0e
+--- /dev/null
++++ b/src/frontends/common/agent/AgentCommands.h
+@@ -0,0 +1,9 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#pragma once
++
++#include <string>
++
++// Executes one JSON-line request and returns the JSON-line response body
++// without its trailing newline. Malformed input still produces a well-formed
++// error response so a client is never left waiting.
++auto agent_command_dispatch(const std::string& request_line) -> std::string;
+diff --git a/src/frontends/common/agent/AgentInput.cpp b/src/frontends/common/agent/AgentInput.cpp
+new file mode 100644
+index 0000000..b303b29
+--- /dev/null
++++ b/src/frontends/common/agent/AgentInput.cpp
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "frontends/common/agent/AgentInput.h"
++
++#include <cstdint>
++#include <deque>
++#include <unordered_map>
++
++#include "apple2/CPU.h"
++#include "core/LinAppleCore.h"
++
++namespace {
++
++constexpr size_t default_limit = 4096;
++
++bool g_capturing = false;
++size_t g_limit = default_limit;
++uint64_t g_dropped = 0;
++std::deque<AgentInputEvent_t> g_events;
++// What each held key latched when it went down. A person can let shift go
++// before the key, and the release has to name the byte the press did or a
++// movie would hold down a key it never pressed.
++std::unordered_map<uint32_t, int> g_down_keys;
++
++auto push(const char* kind, int code, int value) -> void {
++  if (!g_capturing) {
++    return;
++  }
++  if (g_events.size() >= g_limit) {
++    // The newest input is the one a recorder still has a use for, and a
++    // silently short movie is worse than one that says how much it lost.
++    g_events.pop_front();
++    ++g_dropped;
++  }
++  g_events.push_back(
++      AgentInputEvent_t{cpu_get_cumulative_cycles(), kind, code, value});
++}
++
++constexpr int keyboard_slot = 0;
++
++// Asks the keyboard what this event puts on the machine's doorstep. That is
++// the only byte worth logging: it is what a client would have to send to press
++// the same key, shift, caps lock, layout and custom maps included. -1 means
++// nothing arrives, so there is nothing a replay could repeat.
++auto latched_key(const KeyboardEvent_t* event) -> int {
++  KeyboardTranslate_t request{};
++  request.event = *event;
++  size_t size = sizeof(request);
++  if (peripheral_query(keyboard_slot, keyboard_query_translate, &request,
++                       &size) != peripheral_ok) {
++    return -1;
++  }
++  if (request.latched == 0U || request.key == 0 || request.key > 0xFF) {
++    return -1;
++  }
++  return static_cast<int>(request.key);
++}
++
++}  // namespace
++
++auto agent_input_set_capture(bool on, size_t limit) -> void {
++  g_capturing = on;
++  g_limit = (limit > 0) ? limit : default_limit;
++  g_events.clear();
++  g_dropped = 0;
++  g_down_keys.clear();
++}
++
++auto agent_input_capturing() -> bool { return g_capturing; }
++
++auto agent_input_pending() -> size_t { return g_events.size(); }
++
++auto agent_input_dropped() -> uint64_t { return g_dropped; }
++
++auto agent_input_take(size_t max, AgentInputEvent_t* out) -> size_t {
++  size_t taken = 0;
++  while (taken < max && !g_events.empty()) {
++    out[taken] = g_events.front();
++    g_events.pop_front();
++    ++taken;
++  }
++  return taken;
++}
++
++auto agent_input_record_key(const KeyboardEvent_t* event) -> void {
++  if (!g_capturing || event == nullptr) {
++    return;
++  }
++  const bool down = event->is_down != 0U;
++  int code = -1;
++  if (down) {
++    code = latched_key(event);
++    if (code >= 0) {
++      g_down_keys[event->key] = code;
++    }
++  } else {
++    const auto held = g_down_keys.find(event->key);
++    if (held != g_down_keys.end()) {
++      code = held->second;
++      g_down_keys.erase(held);
++    } else {
++      // Released a key that went down before anyone was recording.
++      code = latched_key(event);
++    }
++  }
++  if (code < 0) {
++    // Function keys, modifiers and the rest of the frontend's own keys. They
++    // never reach the Apple II as keystrokes, so logging them would put
++    // something in a movie that replaying cannot reproduce.
++    return;
++  }
++  push("key", code, down ? 1 : 0);
++}
++
++auto agent_input_record_joy_axis(int axis, int value) -> void {
++  push("joy_axis", axis, value);
++}
++
++auto agent_input_record_joy_button(int button, bool down) -> void {
++  push("joy_button", button, down ? 1 : 0);
++}
+diff --git a/src/frontends/common/agent/AgentInput.h b/src/frontends/common/agent/AgentInput.h
+new file mode 100644
+index 0000000..b2cad12
+--- /dev/null
++++ b/src/frontends/common/agent/AgentInput.h
+@@ -0,0 +1,61 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++#include "apple2/peripherals/keyboard/KeyboardCommands.h"
++
++// A log of the input a person generated at the window.
++//
++// The agent socket sees only what a client sends. Someone playing in the SDL
++// window is talking to the frontend instead, so a recorder attached to the
++// socket would watch a game being played and record nothing at all. The
++// frontends hand every keystroke and stick movement here as well, stamped with
++// the cycle it happened on, and a client collects them with input_poll.
++//
++// Capture is off until a client asks for it: an idle session has no reason to
++// keep a buffer of keystrokes, and a session nobody is recording should cost
++// nothing at all.
++
++#ifdef LINAPPLE_AGENT
++
++struct AgentInputEvent_t {
++  uint64_t cycles;
++  // "key", "joy_axis" or "joy_button".
++  const char* kind;
++  // key code / axis number / button number.
++  int code;
++  // key and button: 1 for down. axis: the paddle position, 0..255.
++  int value;
++};
++
++auto agent_input_set_capture(bool on, size_t limit) -> void;
++auto agent_input_capturing() -> bool;
++auto agent_input_pending() -> size_t;
++// Events lost because the buffer filled between polls, since capture started.
++auto agent_input_dropped() -> uint64_t;
++
++// Takes up to `max` events off the front of the buffer.
++auto agent_input_take(size_t max, AgentInputEvent_t* out) -> size_t;
++
++// Called by the frontends, with the event exactly as it was handed to the
++// keyboard. What gets logged is the byte the keyboard says it will latch, not
++// the key the frontend named: a person holding shift types `"`, and a movie
++// that replayed the unshifted key would type `'` instead. The keyboard is
++// asked, because only it knows the layout, the custom maps and the caps lock.
++// A key that reaches the machine as nothing - a function key, a modifier, an
++// Apple key - is not logged at all, since a replay could not send it.
++auto agent_input_record_key(const KeyboardEvent_t* event) -> void;
++auto agent_input_record_joy_axis(int axis, int value) -> void;
++auto agent_input_record_joy_button(int button, bool down) -> void;
++
++#else
++
++// Without the agent module the frontends still call these, so they have to
++// exist and cost nothing.
++inline auto agent_input_record_key(const KeyboardEvent_t*) -> void {}
++inline auto agent_input_record_joy_axis(int, int) -> void {}
++inline auto agent_input_record_joy_button(int, bool) -> void {}
++
++#endif
+diff --git a/src/frontends/common/agent/AgentServer.cpp b/src/frontends/common/agent/AgentServer.cpp
+new file mode 100644
+index 0000000..92d8cac
+--- /dev/null
++++ b/src/frontends/common/agent/AgentServer.cpp
+@@ -0,0 +1,297 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "frontends/common/agent/AgentServer.h"
++
++#include <fcntl.h>
++#include <sys/poll.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include <cerrno>
++#include <cstddef>
++#include <cstring>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "core/Log.h"
++#include "frontends/common/agent/AgentCommands.h"
++
++namespace {
++
++constexpr size_t read_chunk_size = 16384;
++constexpr size_t max_request_bytes = 4 * 1024 * 1024;
++constexpr int listen_backlog = 4;
++constexpr mode_t socket_permissions = 0600;
++
++struct AgentClient_t {
++  int fd = -1;
++  std::string inbox;
++  std::string outbox;
++  size_t sent = 0;
++};
++
++int g_listen_fd = -1;
++std::string g_socket_path;
++std::vector<AgentClient_t> g_clients;
++
++auto set_nonblocking(int fd) -> bool {
++  const int flags = fcntl(fd, F_GETFL, 0);
++  if (flags < 0) {
++    return false;
++  }
++  return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
++}
++
++auto close_client(AgentClient_t& client) -> void {
++  if (client.fd >= 0) {
++    close(client.fd);
++    client.fd = -1;
++  }
++}
++
++// Drains as much of the pending response as the kernel will take. A large
++// screen_capture response easily exceeds the socket buffer, and a short write
++// on a non-blocking socket is normal rather than an error, so the remainder
++// stays queued for the next poll instead of being silently truncated.
++auto flush_outbox(AgentClient_t& client) -> bool {
++  while (client.sent < client.outbox.size()) {
++    const size_t remaining = client.outbox.size() - client.sent;
++    const ssize_t written = send(client.fd, client.outbox.data() + client.sent,
++                                 remaining, MSG_NOSIGNAL);
++    if (written > 0) {
++      client.sent += static_cast<size_t>(written);
++      continue;
++    }
++    if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++      return true;
++    }
++    if (written < 0 && errno == EINTR) {
++      continue;
++    }
++    return false;
++  }
++  client.outbox.clear();
++  client.sent = 0;
++  return true;
++}
++
++auto queue_response(AgentClient_t& client, const std::string& payload) -> void {
++  if (client.sent > 0 && client.sent == client.outbox.size()) {
++    client.outbox.clear();
++    client.sent = 0;
++  }
++  client.outbox.append(payload);
++  client.outbox.push_back('\n');
++}
++
++auto consume_lines(AgentClient_t& client) -> void {
++  size_t start = 0;
++  while (true) {
++    const size_t newline = client.inbox.find('\n', start);
++    if (newline == std::string::npos) {
++      break;
++    }
++    std::string line = client.inbox.substr(start, newline - start);
++    if (!line.empty() && line.back() == '\r') {
++      line.pop_back();
++    }
++    start = newline + 1;
++    if (line.empty()) {
++      continue;
++    }
++    queue_response(client, agent_command_dispatch(line));
++  }
++  if (start > 0) {
++    client.inbox.erase(0, start);
++  }
++  if (client.inbox.size() > max_request_bytes) {
++    Logger::warning("agent: request line exceeded %zu bytes, dropping client\n",
++                    max_request_bytes);
++    close_client(client);
++  }
++}
++
++auto read_client(AgentClient_t& client) -> void {
++  std::vector<char> chunk(read_chunk_size);
++  while (true) {
++    const ssize_t got = recv(client.fd, chunk.data(), chunk.size(), 0);
++    if (got > 0) {
++      client.inbox.append(chunk.data(), static_cast<size_t>(got));
++      if (static_cast<size_t>(got) < chunk.size()) {
++        break;
++      }
++      continue;
++    }
++    if (got == 0) {
++      close_client(client);
++      return;
++    }
++    if (errno == EINTR) {
++      continue;
++    }
++    if (errno != EAGAIN && errno != EWOULDBLOCK) {
++      close_client(client);
++      return;
++    }
++    break;
++  }
++  consume_lines(client);
++}
++
++auto accept_pending() -> void {
++  while (true) {
++    const int fd = accept(g_listen_fd, nullptr, nullptr);
++    if (fd < 0) {
++      return;
++    }
++    if (!set_nonblocking(fd)) {
++      close(fd);
++      continue;
++    }
++    AgentClient_t client;
++    client.fd = fd;
++    g_clients.push_back(std::move(client));
++    Logger::info("agent: client connected (%zu active)\n", g_clients.size());
++  }
++}
++
++auto reap_closed_clients() -> void {
++  for (size_t i = g_clients.size(); i > 0; --i) {
++    if (g_clients.at(i - 1).fd < 0) {
++      g_clients.erase(g_clients.begin() + static_cast<ptrdiff_t>(i - 1));
++    }
++  }
++}
++
++}  // namespace
++
++auto agent_server_start(const char* socket_path) -> int {
++  if (socket_path == nullptr || socket_path[0] == '\0') {
++    return -1;
++  }
++  if (g_listen_fd >= 0) {
++    return 0;
++  }
++
++  sockaddr_un addr = {};
++  addr.sun_family = AF_UNIX;
++  const size_t path_len = std::strlen(socket_path);
++  if (path_len >= sizeof(addr.sun_path)) {
++    Logger::error("agent: socket path too long (%zu bytes)\n", path_len);
++    return -1;
++  }
++  std::memcpy(static_cast<void*>(addr.sun_path), socket_path, path_len + 1);
++
++  const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++  if (fd < 0) {
++    Logger::error("agent: socket() failed: %s\n", std::strerror(errno));
++    return -1;
++  }
++
++  // A socket file left behind by a crashed session would make bind() fail, and
++  // the path is caller-supplied rather than probed, so removing it is safe.
++  unlink(socket_path);
++
++  if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
++    Logger::error("agent: bind(%s) failed: %s\n", socket_path,
++                  std::strerror(errno));
++    close(fd);
++    return -1;
++  }
++  if (chmod(socket_path, socket_permissions) != 0) {
++    Logger::warning("agent: chmod(%s) failed: %s\n", socket_path,
++                    std::strerror(errno));
++  }
++  if (listen(fd, listen_backlog) != 0) {
++    Logger::error("agent: listen() failed: %s\n", std::strerror(errno));
++    close(fd);
++    unlink(socket_path);
++    return -1;
++  }
++  if (!set_nonblocking(fd)) {
++    Logger::error("agent: fcntl(O_NONBLOCK) failed: %s\n",
++                  std::strerror(errno));
++    close(fd);
++    unlink(socket_path);
++    return -1;
++  }
++
++  g_listen_fd = fd;
++  g_socket_path = socket_path;
++  Logger::info("agent: listening on %s\n", socket_path);
++  return 0;
++}
++
++auto agent_server_poll(int timeout_ms) -> void {
++  if (g_listen_fd < 0) {
++    return;
++  }
++
++  std::vector<pollfd> fds;
++  fds.reserve(g_clients.size() + 1);
++  fds.push_back({g_listen_fd, POLLIN, 0});
++  for (const AgentClient_t& client : g_clients) {
++    short events = POLLIN;
++    if (client.sent < client.outbox.size()) {
++      events |= POLLOUT;
++    }
++    fds.push_back({client.fd, events, 0});
++  }
++
++  if (poll(fds.data(), static_cast<nfds_t>(fds.size()), timeout_ms) <= 0) {
++    return;
++  }
++
++  if ((fds.front().revents & POLLIN) != 0) {
++    accept_pending();
++  }
++
++  for (size_t i = 0; i < g_clients.size() && (i + 1) < fds.size(); ++i) {
++    AgentClient_t& client = g_clients.at(i);
++    const short revents = fds.at(i + 1).revents;
++    if (client.fd < 0) {
++      continue;
++    }
++    if ((revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
++      close_client(client);
++      continue;
++    }
++    if ((revents & POLLOUT) != 0 && !flush_outbox(client)) {
++      close_client(client);
++      continue;
++    }
++    if ((revents & POLLIN) != 0) {
++      read_client(client);
++    }
++    if (client.fd >= 0 && !flush_outbox(client)) {
++      close_client(client);
++    }
++  }
++
++  reap_closed_clients();
++}
++
++auto agent_server_stop() -> void {
++  for (AgentClient_t& client : g_clients) {
++    close_client(client);
++  }
++  g_clients.clear();
++
++  if (g_listen_fd >= 0) {
++    close(g_listen_fd);
++    g_listen_fd = -1;
++  }
++  if (!g_socket_path.empty()) {
++    unlink(g_socket_path.c_str());
++    g_socket_path.clear();
++  }
++}
++
++auto agent_server_is_active() -> bool { return g_listen_fd >= 0; }
++
++auto agent_server_client_count() -> int {
++  return static_cast<int>(g_clients.size());
++}
+diff --git a/src/frontends/common/agent/AgentServer.h b/src/frontends/common/agent/AgentServer.h
+new file mode 100644
+index 0000000..bcc0acf
+--- /dev/null
++++ b/src/frontends/common/agent/AgentServer.h
+@@ -0,0 +1,23 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#pragma once
++
++// Unix domain socket control channel for external tool-assistants.
++//
++// Host I/O belongs to the frontend tier, so the socket is owned here while
++// every command handler reaches the machine exclusively through the core bridge
++// in LinAppleCore.h. Each frontend calls agent_server_poll() once per iteration
++// of its own message loop, which keeps emulator state access on the main thread
++// and removes any need for locking.
++
++auto agent_server_start(const char* socket_path) -> int;
++
++// `timeout_ms` is handed straight to poll(): 0 returns at once, which is what a
++// frontend driving its own frame loop wants, while a positive value blocks in
++// the kernel until a command arrives. An idle session should block. Polling
++// with no timeout and sleeping instead wakes the CPU hundreds of times a second
++// for no work, which keeps it out of its deep idle states and drives the clock
++// — and the heat — up even though usage looks near zero.
++auto agent_server_poll(int timeout_ms = 0) -> void;
++auto agent_server_stop() -> void;
++auto agent_server_is_active() -> bool;
++auto agent_server_client_count() -> int;
+diff --git a/src/frontends/common/sdl/JoystickFrontend.cpp b/src/frontends/common/sdl/JoystickFrontend.cpp
+index 388d165..7630470 100644
+--- a/src/frontends/common/sdl/JoystickFrontend.cpp
++++ b/src/frontends/common/sdl/JoystickFrontend.cpp
+@@ -10,8 +10,27 @@
+ #include "core/LinAppleCore.h"
+ #include "core/Peripheral.h"
+ #include "core/Registry.h"
++#include "frontends/common/agent/AgentInput.h"
+ #include "frontends/common/sdl/SdlCompat.h"
+ 
++namespace {
++
++// Every stick movement and button press the frontend produces goes through
++// here. The agent socket cannot see a person playing at the window, so this is
++// where their input is handed to a recorder as well as to the machine.
++auto submit_axis(const JoystickAxisPayload_t& payload) -> void {
++  submit_axis(payload);
++  agent_input_record_joy_axis(payload.joystick * 2 + payload.axis,
++                              payload.value);
++}
++
++auto submit_button(const JoystickButtonPayload_t& payload) -> void {
++  submit_button(payload);
++  agent_input_record_joy_button(payload.button, payload.down);
++}
++
++}  // namespace
++
+ enum {
+   DEVICE_NONE = 0,
+   DEVICE_JOYSTICK = 1,
+@@ -208,9 +227,9 @@ void joy_frontend_update() {
+       }
+ 
+       JoystickButtonPayload_t pb0 = {0, b0};
+-      peripheral_command(0, JOY_CMD_SET_BUTTON, &pb0, sizeof(pb0));
++      submit_button(pb0);
+       JoystickButtonPayload_t pb1 = {1, b1};
+-      peripheral_command(0, JOY_CMD_SET_BUTTON, &pb1, sizeof(pb1));
++      submit_button(pb1);
+ 
+       int x = (static_cast<int>(sdl_compat_get_joystick_axis(
+                    joy1.get(), static_cast<int>(g_joyConfig.joy_axis[0][0]))) -
+@@ -257,10 +276,10 @@ void joy_frontend_update() {
+ 
+       JoystickAxisPayload_t px = {
+           0, 0, static_cast<uint8_t>(x + g_frontend_pdl_trim_x)};
+-      peripheral_command(0, JOY_CMD_SET_AXIS, &px, sizeof(px));
++      submit_axis(px);
+       JoystickAxisPayload_t py = {
+           0, 1, static_cast<uint8_t>(y + g_frontend_pdl_trim_y)};
+-      peripheral_command(0, JOY_CMD_SET_AXIS, &py, sizeof(py));
++      submit_axis(py);
+     }
+   }
+ 
+@@ -276,11 +295,11 @@ void joy_frontend_update() {
+       bool b2 = sdl_compat_get_joystick_button(
+           joy2.get(), static_cast<int>(g_joyConfig.joy1_button_map));
+       JoystickButtonPayload_t pb2 = {2, b2};
+-      peripheral_command(0, JOY_CMD_SET_BUTTON, &pb2, sizeof(pb2));
++      submit_button(pb2);
+       if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1])).device !=
+           DEVICE_NONE) {
+         JoystickButtonPayload_t pb1 = {1, b2};
+-        peripheral_command(0, JOY_CMD_SET_BUTTON, &pb1, sizeof(pb1));
++        submit_button(pb1);
+       }
+ 
+       int x = (static_cast<int>(sdl_compat_get_joystick_axis(
+@@ -301,9 +320,9 @@ void joy_frontend_update() {
+       if (y > 255) y = 255;
+ 
+       JoystickAxisPayload_t px = {1, 0, static_cast<uint8_t>(x)};
+-      peripheral_command(0, JOY_CMD_SET_AXIS, &px, sizeof(px));
++      submit_axis(px);
+       JoystickAxisPayload_t py = {1, 1, static_cast<uint8_t>(y)};
+-      peripheral_command(0, JOY_CMD_SET_AXIS, &py, sizeof(py));
++      submit_axis(py);
+     }
+   }
+ }
+@@ -419,25 +438,25 @@ auto joy_frontend_process_key(SdlKeycode_t virtkey, bool extended, bool down,
+         if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1])).device !=
+             DEVICE_KEYBOARD) {
+           JoystickButtonPayload_t p = {0, true};
+-          peripheral_command(0, JOY_CMD_SET_BUTTON, &p, sizeof(p));
++          submit_button(p);
+         } else if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1]))
+                        .device != DEVICE_NONE) {
+           JoystickButtonPayload_t p2 = {2, true};
+-          peripheral_command(0, JOY_CMD_SET_BUTTON, &p2, sizeof(p2));
++          submit_button(p2);
+           JoystickButtonPayload_t p1 = {1, true};
+-          peripheral_command(0, JOY_CMD_SET_BUTTON, &p1, sizeof(p1));
++          submit_button(p1);
+         }
+       } else {
+         if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1])).device !=
+             DEVICE_KEYBOARD) {
+           JoystickButtonPayload_t p = {0, false};
+-          peripheral_command(0, JOY_CMD_SET_BUTTON, &p, sizeof(p));
++          submit_button(p);
+         } else if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1]))
+                        .device != DEVICE_NONE) {
+           JoystickButtonPayload_t p2 = {2, false};
+-          peripheral_command(0, JOY_CMD_SET_BUTTON, &p2, sizeof(p2));
++          submit_button(p2);
+           JoystickButtonPayload_t p1 = {1, false};
+-          peripheral_command(0, JOY_CMD_SET_BUTTON, &p1, sizeof(p1));
++          submit_button(p1);
+         }
+       }
+     } else if ((virtkey == SDLK_KP_PERIOD) || (virtkey == SDLK_DELETE)) {
+@@ -445,13 +464,13 @@ auto joy_frontend_process_key(SdlKeycode_t virtkey, bool extended, bool down,
+         if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1])).device !=
+             DEVICE_KEYBOARD) {
+           JoystickButtonPayload_t p = {1, true};
+-          peripheral_command(0, JOY_CMD_SET_BUTTON, &p, sizeof(p));
++          submit_button(p);
+         }
+       } else {
+         if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1])).device !=
+             DEVICE_KEYBOARD) {
+           JoystickButtonPayload_t p = {1, false};
+-          peripheral_command(0, JOY_CMD_SET_BUTTON, &p, sizeof(p));
++          submit_button(p);
+         }
+       }
+     } else if ((down && !autorep) || (centering_type == MODE_CENTERING)) {
+@@ -492,10 +511,10 @@ auto joy_frontend_process_key(SdlKeycode_t virtkey, bool extended, bool down,
+       }
+       JoystickAxisPayload_t px = {static_cast<uint8_t>(joy_num), 0,
+                                   static_cast<uint8_t>(x)};
+-      peripheral_command(0, JOY_CMD_SET_AXIS, &px, sizeof(px));
++      submit_axis(px);
+       JoystickAxisPayload_t py = {static_cast<uint8_t>(joy_num), 1,
+                                   static_cast<uint8_t>(y)};
+-      peripheral_command(0, JOY_CMD_SET_AXIS, &py, sizeof(py));
++      submit_axis(py);
+     }
+   }
+   return keychange;
+@@ -542,9 +561,9 @@ auto joy_frontend_process_mouse_motion(int x, int max_x, int y, int max_y)
+          joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[joy_num]))
+                  .device == DEVICE_MOUSE)) {
+       JoystickAxisPayload_t px = {joy_num, 0, static_cast<uint8_t>(joy_x)};
+-      peripheral_command(0, JOY_CMD_SET_AXIS, &px, sizeof(px));
++      submit_axis(px);
+       JoystickAxisPayload_t py = {joy_num, 1, static_cast<uint8_t>(joy_y)};
+-      peripheral_command(0, JOY_CMD_SET_AXIS, &py, sizeof(py));
++      submit_axis(py);
+     }
+   }
+ }
+@@ -557,10 +576,10 @@ auto joy_frontend_process_mouse_button(int button, bool down) -> void {
+                  .device == DEVICE_MOUSE)) {
+       if (button == 0) {
+         JoystickButtonPayload_t pb0 = {0, down};
+-        peripheral_command(0, JOY_CMD_SET_BUTTON, &pb0, sizeof(pb0));
++        submit_button(pb0);
+       } else if (button == 1) {
+         JoystickButtonPayload_t pb1 = {1, down};
+-        peripheral_command(0, JOY_CMD_SET_BUTTON, &pb1, sizeof(pb1));
++        submit_button(pb1);
+       }
+     }
+   }
+diff --git a/src/frontends/common/sdl/Keyboard.cpp b/src/frontends/common/sdl/Keyboard.cpp
+index c1259e5..83454fb 100644
+--- a/src/frontends/common/sdl/Keyboard.cpp
++++ b/src/frontends/common/sdl/Keyboard.cpp
+@@ -9,6 +9,7 @@
+ #include "core/Registry.h"
+ #include "frontends/common/Frontend.h"
+ #include "frontends/common/KeyboardTranslator.h"
++#include "frontends/common/agent/AgentInput.h"
+ #include "frontends/common/sdl/SdlCompat.h"
+ 
+ static int keyboard_mapping_mode = 0;
+@@ -118,6 +119,9 @@ auto frontend_dispatch_key_event(uint32_t scancode, uint32_t keycode,
+                         mods.gui,
+                         {0, 0, 0}};
+   peripheral_command(0, keyboard_cmd_event, &ev, sizeof(ev));
++  // Everything a person types passes through here, which is where a recorder
++  // on the socket can see it - it never sees the SDL event itself.
++  agent_input_record_key(&ev);
+ }
+ 
+ auto frontend_handle_key_event(SdlKeycode_t key, bool is_down) -> bool {
+diff --git a/src/frontends/headless/Main.cpp b/src/frontends/headless/Main.cpp
+index 64a533e..8fedd61 100644
+--- a/src/frontends/headless/Main.cpp
++++ b/src/frontends/headless/Main.cpp
+@@ -1,15 +1,69 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++#include <time.h>
++
+ #include <cstddef>
+ #include <cstdint>
+ #include <iostream>
++#include <string>
+ 
++#include "core/AudioMixer.h"
+ #include "core/LinAppleCore.h"
+ #include "frontends/common/AppArgs.h"
+ #include "frontends/common/AppConfig.h"
+ #include "frontends/common/AppController.h"
++#include "frontends/common/AudioDumper.h"
++#include "frontends/common/Frontend.h"
++#include "frontends/common/agent/AgentServer.h"
++
++namespace {
++
++constexpr int headless_warmup_frames = 60;
++constexpr int apple2_frame_cycles = 17030;
++constexpr int idle_poll_timeout_ms = 200;
++constexpr long frame_sleep_ns = 16L * 1000L * 1000L;
++
++// The speaker hands over stereo pairs at SPKR_SAMPLE_RATE, which is what the
++// SDL frontends dump too, so a file written here plays the same everywhere.
++AudioDumper_t g_audio_dumper;
++std::string g_audio_dump_path;
++
++// Without a socket the emulator has no one to talk to, so the machine only
++// needs long enough to finish booting before the process reports back.
++auto run_fixed_frames(int frames) -> void {
++  for (int i = 0; i < frames; ++i) {
++    linapple_run_frame(apple2_frame_cycles);
++  }
++}
++
++// Under agent control the client owns the clock: it decides when frames advance
++// via run_frames, so this loop only services the socket.
++//
++// Both branches sleep. A paused session obviously should, but a running one
++// must too: without a wait this loop emulates as fast as the host allows and
++// pins a core at full clock for as long as the session is open. Pacing to the
++// Apple II's own frame rate keeps a watched session correct and idle-ish;
++// a client that wants to fast-forward asks for it explicitly through
++// run_frames or turbo_set rather than getting it by accident here.
++auto run_agent_loop() -> void {
++  const timespec frame_gap = {0, frame_sleep_ns};
++  while (g_state.mode != MODE_EXIT) {
++    if (g_state.mode == MODE_RUNNING) {
++      agent_server_poll(0);
++      linapple_run_frame(apple2_frame_cycles);
++      if (!linapple_get_turbo()) {
++        nanosleep(&frame_gap, nullptr);
++      }
++      continue;
++    }
++    // Paused, so there is nothing to emulate and no reason to wake up until a
++    // command actually arrives: block in poll() rather than spinning on a
++    // short sleep.
++    agent_server_poll(idle_poll_timeout_ms);
++  }
++}
++
++}  // namespace
+ 
+-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters): video callback
+-// signature
+ auto video_callback(const uint32_t* pixels, int width, int height, int pitch)
+     -> void {
+   (void)pixels;
+@@ -18,9 +72,41 @@ auto video_callback(const uint32_t* pixels, int width, int height, int pitch)
+   (void)pitch;
+ }
+ 
++// Headless has no sound card, so this is where the machine's audio would
++// otherwise be thrown away. Sent to a dumper instead, it becomes a recording
++// of exactly what the emulation produced - and because the samples arrive on
++// emulated time rather than a device's clock, a session replayed as fast as
++// the host allows still writes a file that plays at the right speed.
+ auto audio_callback(const int16_t* samples, size_t num_samples) -> void {
+-  (void)samples;
+-  (void)num_samples;
++  if (g_audio_dumper.is_active()) {
++    audio_dumper_put_samples(&g_audio_dumper, samples,
++                             static_cast<uint32_t>(num_samples));
++  }
++}
++
++auto frontend_audio_dump_start(const char* path) -> bool {
++  if (path == nullptr || *path == '\0') {
++    return false;
++  }
++  frontend_audio_dump_stop();
++  if (audio_dumper_initialize(&g_audio_dumper, path, SPKR_SAMPLE_RATE, 2) !=
++      0) {
++    return false;
++  }
++  g_audio_dump_path = path;
++  return true;
++}
++
++auto frontend_audio_dump_stop() -> void {
++  if (g_audio_dumper.is_active()) {
++    // Finalizing writes the RIFF sizes, which is what makes the file playable.
++    audio_dumper_finalize(&g_audio_dumper);
++  }
++  g_audio_dump_path.clear();
++}
++
++auto frontend_audio_dump_path() -> const char* {
++  return g_audio_dumper.is_active() ? g_audio_dump_path.c_str() : "";
+ }
+ 
+ auto title_callback(const char* title) -> void { (void)title; }
+@@ -47,13 +133,34 @@ auto main(int argc, char** argv) -> int {
+ 
+   app_controller_load_initial_media(&config);
+ 
+-  constexpr int HEADLESS_FRAMES = 60;
+-  constexpr int apple2_frame_cycles = 17030;
++  if (config.audio_dump_path.at(0) != '\0') {
++    if (!frontend_audio_dump_start(config.audio_dump_path.data())) {
++      std::cout << "audio: cannot write " << config.audio_dump_path.data()
++                << std::endl;
++      app_controller_shutdown();
++      return 1;
++    }
++    std::cout << "audio: recording to " << config.audio_dump_path.data()
++              << std::endl;
++  }
+ 
+-  for (int i = 0; i < HEADLESS_FRAMES; ++i) {
+-    linapple_run_frame(apple2_frame_cycles);
++  const bool agent_requested = config.agent_socket_path.at(0) != '\0';
++  if (agent_requested &&
++      agent_server_start(config.agent_socket_path.data()) != 0) {
++    app_controller_shutdown();
++    return 1;
++  }
++
++  if (agent_server_is_active()) {
++    run_agent_loop();
++  } else {
++    run_fixed_frames(headless_warmup_frames);
+   }
+ 
++  agent_server_stop();
++  // A WAV without its sizes written back is not a WAV, so the recording has to
++  // be closed even when the session ends some other way.
++  frontend_audio_dump_stop();
+   app_controller_shutdown();
+ 
+   std::cout << "Headless execution complete." << std::endl;
+diff --git a/src/frontends/sdl3/Main.cpp b/src/frontends/sdl3/Main.cpp
+index 911516c..9852ac4 100644
+--- a/src/frontends/sdl3/Main.cpp
++++ b/src/frontends/sdl3/Main.cpp
+@@ -18,8 +18,9 @@
+ #include "frontends/common/AppController.h"
+ #include "frontends/common/AudioDumper.h"
+ #include "frontends/common/Frontend.h"
+-#include "frontends/sdl3/Frame.h"
++#include "frontends/common/agent/AgentServer.h"
+ #include "frontends/common/sdl/JoystickFrontend.h"
++#include "frontends/sdl3/Frame.h"
+ 
+ // SDL Audio Stream for Frontend
+ bool g_ds_available = false;
+@@ -51,6 +52,35 @@ static void SDLCALL sdl3_audio_callback(void* userdata, SDL_AudioStream* stream,
+   SDL_free(temp_buf);
+ }
+ 
++// Starting and stopping the recording while the machine runs, rather than only
++// from the command line. What is dumped here is the mixer's output - the same
++// thing the sound card is playing, Mockingboard included - which is not quite
++// what the headless frontend writes, where there is no mixer and the samples
++// come straight from the speaker.
++auto frontend_audio_dump_start(const char* path) -> bool {
++  if (path == nullptr || *path == '\0') {
++    return false;
++  }
++  frontend_audio_dump_stop();
++  if (audio_dumper_initialize(&g_audio_dumper, path, SPKR_SAMPLE_RATE, 2) !=
++      0) {
++    return false;
++  }
++  g_audio_dump_file = path;
++  return true;
++}
++
++auto frontend_audio_dump_stop() -> void {
++  if (g_audio_dumper.is_active()) {
++    audio_dumper_finalize(&g_audio_dumper);
++  }
++  g_audio_dump_file.clear();
++}
++
++auto frontend_audio_dump_path() -> const char* {
++  return g_audio_dumper.is_active() ? g_audio_dump_file.c_str() : "";
++}
++
+ auto ds_init() -> bool {
+   if (g_audioStream) return true;
+ 
+@@ -111,18 +141,28 @@ void sys_input() {
+ 
+ void enter_message_loop() {
+   constexpr int target_frame_ms = 16;
++  // While an agent has the machine parked there are no frames to produce, so
++  // the loop waits inside the socket poll instead of spinning at 60 Hz for
++  // nothing. That both cuts idle wakeups and shortens the round trip, since a
++  // command wakes the loop the moment it lands rather than at the next tick.
++  constexpr int paused_poll_ms = 30;
+   while (g_state.mode != MODE_EXIT) {
+     sys_input();
++
++    const bool parked =
++        g_state.mode == MODE_PAUSED && agent_server_client_count() > 0;
++    agent_server_poll(parked ? paused_poll_ms : 0);
++
+     joy_frontend_update();
+ 
+     uint32_t cycles = linapple_get_frame_cycles();
+     linapple_run_frame(cycles);
+     draw_frame_window();
+ 
+-    if (!linapple_get_turbo()) {
+-      SDL_Delay(target_frame_ms);
+-    } else {
++    if (parked || linapple_get_turbo()) {
+       SDL_Delay(0);
++    } else {
++      SDL_Delay(target_frame_ms);
+     }
+   }
+ }
+@@ -147,6 +187,13 @@ auto main(int argc, char** argv) -> int {
+ 
+   if (sys_init() != 0) return 1;
+ 
++  if (config.agent_socket_path.at(0) != '\0') {
++    if (agent_server_start(config.agent_socket_path.data()) != 0) {
++      sys_shutdown();
++      return 1;
++    }
++  }
++
+   do {
+     app_controller_set_restart(false);
+ 
+@@ -168,6 +215,7 @@ auto main(int argc, char** argv) -> int {
+     session_shutdown();
+   } while (app_controller_should_restart());
+ 
++  agent_server_stop();
+   sys_shutdown();
+   return 0;
+ }
+diff --git a/src/frontends/tui/TuiInput.cpp b/src/frontends/tui/TuiInput.cpp
+index 042811a..210c0fb 100644
+--- a/src/frontends/tui/TuiInput.cpp
++++ b/src/frontends/tui/TuiInput.cpp
+@@ -562,7 +562,13 @@ auto tui_input_poll() -> void {
+     struct js_event js{};
+     while (read(g_joy_fd, &js, sizeof(js)) > 0) {
+       if ((js.type & JS_EVENT_AXIS) != 0) {
+-        linapple_set_joystick_axis(js.number, js.value);
++        // A Linux joystick reports -32767..32767 while a paddle is 0..255 with
++        // 127 at rest, and there is nowhere to put an axis past the second
++        // stick.
++        if (js.number <= 3) {
++          const int position = (static_cast<int>(js.value) + 32768) >> 8;
++          linapple_set_joystick_axis(js.number, position);
++        }
+       } else if ((js.type & JS_EVENT_BUTTON) != 0) {
+         linapple_set_joystick_button(js.number, js.value);
+       }
+diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
+new file mode 100644
+index 0000000..321b681
+--- /dev/null
++++ b/tests/test_agent_commands.cpp
+@@ -0,0 +1,1000 @@
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Agent control-channel tests.
++//
++// The dispatcher is the surface an external tool sees, so what matters here is
++// the contract it promises that client: a well-formed response for every input,
++// a refusal rather than a wild read for an out-of-range parameter, a screen
++// hash that follows whichever page the machine is actually displaying, and a
++// wait that ends for each of its three reasons. The server cases cover the
++// framing around that contract — line splitting and the request size cap.
++#include <fcntl.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include <cerrno>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include "HeadlessHarness.h"
++#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
++#include <nlohmann/json.hpp>
++
++#include "apple2/CPU.h"
++#include "apple2/Memory.h"
++#include "apple2/Video.h"
++#include "apple2/peripherals/disk/DiskCommands.h"
++#include "apple2/peripherals/joystick/JoystickCommands.h"
++#include "apple2/peripherals/keyboard/KeyboardCommands.h"
++#include "core/LinAppleCore.h"
++#include "core/Peripheral.h"
++#include "doctest.h"
++#include "frontends/common/agent/AgentCommands.h"
++#include "frontends/common/agent/AgentInput.h"
++#include "frontends/common/agent/AgentServer.h"
++
++namespace {
++
++using Json = nlohmann::json;
++
++// Whether a frontend can record at all is the frontend's business; what the
++// command has to get right is refusing a request it cannot honour and saying
++// afterwards what is actually being written. A fake recorder is enough to test
++// that, and it stands in for the real one the way a headless build has none.
++std::string g_fake_dump_path;
++
++}  // namespace
++
++auto frontend_audio_dump_start(const char* path) -> bool {
++  if (path == nullptr || std::string(path) == "/nowhere/at/all.wav") {
++    return false;  // the frontend cannot write there
++  }
++  g_fake_dump_path = path;
++  return true;
++}
++
++auto frontend_audio_dump_stop() -> void { g_fake_dump_path.clear(); }
++
++auto frontend_audio_dump_path() -> const char* {
++  return g_fake_dump_path.c_str();
++}
++
++namespace {
++
++// Every response is a JSON object on one line, including the error paths — a
++// client that cannot parse a reply has no way to tell a refusal from a hang.
++auto dispatch_line(const std::string& line) -> Json {
++  const std::string reply = agent_command_dispatch(line);
++  CHECK(reply.find('\n') == std::string::npos);
++  Json parsed = Json::parse(reply, nullptr, false);
++  REQUIRE_FALSE(parsed.is_discarded());
++  REQUIRE(parsed.is_object());
++  REQUIRE(parsed.contains("ok"));
++  return parsed;
++}
++
++// What a frontend hands the keyboard when a person presses a key. The mods
++// travel with the event, which is how the keyboard knows a held shift turns
++// `p` into `P`.
++auto key_event(uint32_t key, bool down, bool shift = false, bool ctrl = false)
++    -> KeyboardEvent_t {
++  return KeyboardEvent_t{key,
++                         static_cast<uint8_t>(down ? 1 : 0),
++                         static_cast<uint8_t>(shift ? 1 : 0),
++                         static_cast<uint8_t>(ctrl ? 1 : 0),
++                         0,
++                         0,
++                         {0, 0, 0}};
++}
++
++auto record_key(uint32_t key, bool down, bool shift = false, bool ctrl = false)
++    -> void {
++  const KeyboardEvent_t event = key_event(key, down, shift, ctrl);
++  agent_input_record_key(&event);
++}
++
++auto command(const char* cmd, const Json& params = Json::object()) -> Json {
++  Json request;
++  request["cmd"] = cmd;
++  request["params"] = params;
++  return dispatch_line(request.dump());
++}
++
++auto ok_result(const char* cmd, const Json& params = Json::object()) -> Json {
++  const Json response = command(cmd, params);
++  REQUIRE_MESSAGE(response.at("ok").get<bool>() == true, response.dump());
++  return response.at("result");
++}
++
++auto rejects(const char* cmd, const Json& params) -> bool {
++  const Json response = command(cmd, params);
++  if (response.at("ok").get<bool>()) {
++    return false;
++  }
++  // An error carries a message rather than a result, so a client can log
++  // something useful instead of "the call failed".
++  return response.contains("error") && response.at("error").is_string() &&
++         !response.at("error").get<std::string>().empty() &&
++         !response.contains("result");
++}
++
++// The soft switches have no setter of their own: the machine flips them by
++// touching $C05x, and the tests drive them the same way the CPU would.
++auto touch_switch(uint16_t address) -> void {
++  video_set_mode(0, address, 0, 0, 0);
++}
++
++auto select_text_page1() -> void {
++  touch_switch(0xC000);  // 80STORE off, so PAGE2 means the display page
++  touch_switch(0xC00C);  // 40 columns
++  touch_switch(0xC054);  // page 1
++  touch_switch(0xC052);  // not mixed
++  touch_switch(0xC051);  // text
++}
++
++auto poke(uint16_t address, uint8_t value) -> void {
++  uint8_t* cell = mem_get_main_ptr(address);
++  REQUIRE(cell != nullptr);
++  *cell = value;
++}
++
++// The joystick has no query of its own, so its save state is how a test sees
++// where the sticks actually are. Input commands are queued rather than applied
++// on the spot - they land when the machine next runs - so the queue is drained
++// first, which is what the next run_frames would have done.
++auto joystick_state_raw() -> JoystickSaveState_t {
++  JoystickSaveState_t state = {};
++  size_t size = sizeof(state);
++  peripheral_save_state_by_name(0, "Joystick", &state, &size);
++  REQUIRE(size == sizeof(state));
++  return state;
++}
++
++auto joystick_state() -> JoystickSaveState_t {
++  peripheral_manager_think(0);
++  return joystick_state_raw();
++}
++
++auto screen_hash() -> uint64_t {
++  return ok_result("screen_hash").at("hash").get<uint64_t>();
++}
++
++// Parks the CPU on a program of our own so the screen changes exactly when the
++// test says it does. Left to the boot ROM the machine would be hunting for a
++// disk, and a wait that has to settle would be racing the drive.
++auto run_program(uint16_t address, const std::vector<uint8_t>& code) -> void {
++  for (size_t i = 0; i < code.size(); ++i) {
++    poke(static_cast<uint16_t>(address + i), code.at(i));
++  }
++  CpuRegisters_t* regs = cpu_get_registers();
++  REQUIRE(regs != nullptr);
++  regs->pc = address;
++  regs->is_jammed = 0;
++}
++
++// JMP to itself: the machine stays alive and the screen never moves.
++const std::vector<uint8_t> program_idle = {0x4C, 0x00, 0x03};
++
++// Writes one character to the top-left cell, then idles. One change, then
++// quiet — what a game redrawing a screen and waiting for input looks like.
++const std::vector<uint8_t> program_draw_once = {
++    0xA9, 0xC1,        // LDA #$C1
++    0x8D, 0x00, 0x04,  // STA $0400
++    0x4C, 0x05, 0x03   // JMP $0305
++};
++
++// Copies the keyboard latch to the top-left cell, forever. What the running
++// program can see of an input, as opposed to what the peripheral holds.
++const std::vector<uint8_t> program_watch_keyboard = {
++    0xAD, 0x00, 0xC0,  // LDA $C000
++    0x8D, 0x00, 0x04,  // STA $0400
++    0x4C, 0x00, 0x03   // JMP $0300
++};
++
++// Never stops repainting, which is the case a wait must not sit out forever.
++const std::vector<uint8_t> program_draw_forever = {
++    0xEE, 0x00, 0x04,  // INC $0400
++    0x4C, 0x00, 0x03   // JMP $0300
++};
++
++auto wait_params(int64_t max_frames, int64_t chunk) -> Json {
++  Json params;
++  params["max_frames"] = max_frames;
++  params["chunk"] = chunk;
++  params["stable"] = 2;
++  // Full duty: the rest between chunks exists to keep a long wait from cooking
++  // a core, and a test has no reason to pay for it.
++  params["duty"] = 100;
++  return params;
++}
++
++// --- socket helpers --------------------------------------------------------
++
++struct AgentSocketFixture_t {
++  std::string directory;
++  std::string path;
++  int fd = -1;
++
++  AgentSocketFixture_t() {
++    std::vector<char> pattern(64);
++    const char* tmpdir = getenv("TMPDIR");
++    const std::string base =
++        (tmpdir != nullptr && tmpdir[0] != '\0') ? tmpdir : "/tmp";
++    const std::string tpl = base + "/linapple-agent-XXXXXX";
++    pattern.assign(tpl.begin(), tpl.end());
++    pattern.push_back('\0');
++    REQUIRE(mkdtemp(pattern.data()) != nullptr);
++    directory = pattern.data();
++    path = directory + "/agent.sock";
++  }
++
++  ~AgentSocketFixture_t() {
++    disconnect();
++    agent_server_stop();
++    unlink(path.c_str());
++    rmdir(directory.c_str());
++  }
++
++  AgentSocketFixture_t(const AgentSocketFixture_t&) = delete;
++  auto operator=(const AgentSocketFixture_t&) -> AgentSocketFixture_t& = delete;
++  AgentSocketFixture_t(AgentSocketFixture_t&&) = delete;
++  auto operator=(AgentSocketFixture_t&&) -> AgentSocketFixture_t& = delete;
++
++  auto start() -> void {
++    REQUIRE(agent_server_start(path.c_str()) == 0);
++    REQUIRE(agent_server_is_active());
++  }
++
++  auto connect_client() -> void {
++    fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    REQUIRE(fd >= 0);
++    sockaddr_un addr = {};
++    addr.sun_family = AF_UNIX;
++    std::memcpy(static_cast<void*>(addr.sun_path), path.c_str(),
++                path.size() + 1);
++    REQUIRE(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
++    // Non-blocking on this side too: the server drains only when the test
++    // pumps it, so a blocking write of a large request would deadlock against
++    // a test that is waiting to make that very call.
++    const int flags = fcntl(fd, F_GETFL, 0);
++    REQUIRE(fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
++    agent_server_poll(0);
++    REQUIRE(agent_server_client_count() == 1);
++  }
++
++  auto disconnect() -> void {
++    if (fd >= 0) {
++      close(fd);
++      fd = -1;
++    }
++  }
++
++  auto send_raw(const std::string& payload) -> void {
++    size_t sent = 0;
++    while (sent < payload.size()) {
++      const ssize_t written =
++          send(fd, payload.data() + sent, payload.size() - sent, MSG_NOSIGNAL);
++      if (written > 0) {
++        sent += static_cast<size_t>(written);
++        continue;
++      }
++      if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++        agent_server_poll(0);
++        continue;
++      }
++      FAIL("send to agent socket failed");
++      return;
++    }
++  }
++
++  // Pumps both sides until the requested number of newline-terminated replies
++  // has arrived, or the budget runs out. A bounded loop rather than a blocking
++  // read keeps a regression from turning into a hung test run.
++  auto collect_replies(size_t count) -> std::vector<std::string> {
++    std::string inbox;
++    std::vector<std::string> lines;
++    for (int attempt = 0; attempt < 200 && lines.size() < count; ++attempt) {
++      agent_server_poll(1);
++      std::vector<char> chunk(4096);
++      const ssize_t got = recv(fd, chunk.data(), chunk.size(), 0);
++      if (got > 0) {
++        inbox.append(chunk.data(), static_cast<size_t>(got));
++      }
++      size_t start = 0;
++      lines.clear();
++      while (true) {
++        const size_t newline = inbox.find('\n', start);
++        if (newline == std::string::npos) {
++          break;
++        }
++        lines.push_back(inbox.substr(start, newline - start));
++        start = newline + 1;
++      }
++    }
++    return lines;
++  }
++};
++
++}  // namespace
++
++// --- malformed input -------------------------------------------------------
++
++TEST_CASE("Agent: unusable input still answers with ok:false") {
++  // No harness: none of these reach the machine, and a reply is owed even when
++  // the request never named a command.
++  const char* const unusable[] = {
++      "",
++      "not json at all",
++      "{",
++      "[1, 2, 3]",           // valid JSON, but not a request object
++      "\"ping\"",            // ditto
++      "null",                //
++      "{}",                  // no cmd
++      "{\"cmd\": 42}",       // cmd of the wrong type
++      "{\"params\": {}}",    // params without a cmd
++      "{\"cmd\": \"nope\"}"  // a command that does not exist
++  };
++  for (const char* line : unusable) {
++    const Json response = dispatch_line(line);
++    CHECK_FALSE(response.at("ok").get<bool>());
++    CHECK(response.contains("error"));
++    CHECK(response.at("error").is_string());
++    // id is always present, so a client can match a reply to its request even
++    // when the request was too broken to carry one.
++    CHECK(response.contains("id"));
++  }
++}
++
++TEST_CASE("Agent: the request id comes back on both paths") {
++  const Json accepted = dispatch_line("{\"cmd\": \"ping\", \"id\": 17}");
++  CHECK(accepted.at("ok").get<bool>());
++  CHECK(accepted.at("id").get<int>() == 17);
++
++  const Json refused = dispatch_line("{\"cmd\": \"nope\", \"id\": \"abc\"}");
++  CHECK_FALSE(refused.at("ok").get<bool>());
++  CHECK(refused.at("id").get<std::string>() == "abc");
++
++  const Json anonymous = dispatch_line("{\"cmd\": \"ping\"}");
++  CHECK(anonymous.at("id").is_null());
++}
++
++// --- parameter ranges ------------------------------------------------------
++
++TEST_CASE("Agent: mem_read refuses addresses outside the address space") {
++  HeadlessHarness_t harness;
++
++  CHECK(rejects("mem_read", {{"addr", -1}}));
++  CHECK(rejects("mem_read", {{"addr", 0x10000}}));
++  CHECK(rejects("mem_read", Json::object()));  // addr defaults to -1
++  CHECK(
++      rejects("mem_read", {{"addr", "0x300"}}));  // wrong type, same as absent
++  CHECK(rejects("mem_read", {{"addr", 0x300}, {"len", 0}}));
++  CHECK(rejects("mem_read", {{"addr", 0x300}, {"len", -4}}));
++  CHECK(rejects("mem_read", {{"addr", 0x300}, {"len", 0x10001}}));
++  // In range on its own, but the read would run off the end of memory.
++  CHECK(rejects("mem_read", {{"addr", 0xFFFF}, {"len", 2}}));
++
++  // The edges that should be allowed still are.
++  CHECK(ok_result("mem_read", {{"addr", 0xFFFF}, {"len", 1}}).at("len") == 1);
++  CHECK(ok_result("mem_read", {{"addr", 0}, {"len", 0x10000}}).at("len") ==
++        0x10000);
++}
++
++TEST_CASE("Agent: mem_read returns what memory holds") {
++  HeadlessHarness_t harness;
++
++  poke(0x6000, 0xDE);
++  poke(0x6001, 0xAD);
++  poke(0x6002, 0xBE);
++  poke(0x6003, 0xEF);
++
++  const Json result = ok_result("mem_read", {{"addr", 0x6000}, {"len", 4}});
++  CHECK(result.at("addr").get<int>() == 0x6000);
++  CHECK(result.at("len").get<int>() == 4);
++  CHECK(result.at("data").get<std::string>() == "3q2+7w==");
++}
++
++TEST_CASE("Agent: mem_write refuses a payload it cannot place") {
++  HeadlessHarness_t harness;
++
++  CHECK(rejects("mem_write", {{"addr", -1}, {"bytes", {1}}}));
++  CHECK(rejects("mem_write", {{"addr", 0x10000}, {"bytes", {1}}}));
++  CHECK(rejects("mem_write", {{"addr", 0x300}}));  // neither data nor bytes
++  CHECK(rejects("mem_write", {{"addr", 0x300}, {"bytes", Json::array()}}));
++  CHECK(rejects("mem_write", {{"addr", 0x300}, {"bytes", {"nope"}}}));
++  CHECK(rejects("mem_write", {{"addr", 0x300}, {"data", "not base64!"}}));
++  // One byte past the end of memory.
++  CHECK(rejects("mem_write", {{"addr", 0xFFFF}, {"bytes", {1, 2}}}));
++
++  const Json written =
++      ok_result("mem_write", {{"addr", 0x6000}, {"data", "3q2+7w=="}});
++  CHECK(written.at("written").get<int>() == 4);
++  CHECK(ok_result("mem_read", {{"addr", 0x6000}, {"len", 4}})
++            .at("data")
++            .get<std::string>() == "3q2+7w==");
++}
++
++TEST_CASE("Agent: disk_insert checks the drive and the path length") {
++  HeadlessHarness_t harness;
++
++  CHECK(rejects("disk_insert", {{"drive", 0}}));  // no path
++  CHECK(rejects("disk_insert", {{"path", ""}, {"drive", 0}}));
++  CHECK(rejects("disk_insert", {{"path", "/tmp/a.dsk"}}));  // no drive
++  CHECK(rejects("disk_insert", {{"path", "/tmp/a.dsk"}, {"drive", 2}}));
++  CHECK(rejects("disk_insert", {{"path", "/tmp/a.dsk"}, {"drive", -1}}));
++
++  // The path is copied into a fixed buffer with its terminator, so a path of
++  // exactly the buffer size is one byte too long rather than a tight fit.
++  const std::string too_long(disk_insert_path_max, 'x');
++  const Json refused =
++      command("disk_insert", {{"path", too_long}, {"drive", 0}});
++  CHECK_FALSE(refused.at("ok").get<bool>());
++  CHECK(refused.at("error").get<std::string>() == "path too long");
++
++  // One byte shorter is a fit, and the dispatcher passes it to the drive. The
++  // drive takes any path it can copy, so the reply is ok even though no such
++  // file exists — what tells a client the disk is not in is `loaded`, not the
++  // status of the call.
++  const std::string longest(disk_insert_path_max - 1, 'x');
++  const Json accepted =
++      command("disk_insert", {{"path", longest}, {"drive", 0}});
++  CHECK(accepted.at("ok").get<bool>());
++  CHECK(accepted.at("result").at("drives").at(0).at("loaded").get<bool>() ==
++        false);
++
++  CHECK(rejects("disk_eject", Json::object()));
++  CHECK(rejects("disk_eject", {{"drive", 2}}));
++}
++
++TEST_CASE("Agent: the remaining bounded parameters refuse their edges") {
++  HeadlessHarness_t harness;
++
++  CHECK(rejects("key_press", {{"key", -1}}));
++  CHECK(rejects("key_press", {{"key", 256}}));
++  CHECK(rejects("key_press", Json::object()));
++  CHECK(rejects("key_state", {{"key", 256}}));
++  CHECK(rejects("key_type", Json::object()));  // empty text is not a keystroke
++
++  CHECK(rejects("joy_axis", {{"axis", -1}}));
++  CHECK(rejects("joy_axis", {{"axis", 4}}));
++  CHECK(rejects("joy_button", {{"button", 3}}));
++
++  CHECK(rejects("run_frames", {{"frames", -1}}));
++  CHECK(rejects("run_frames", {{"frames", 60 * 60 * 10 + 1}}));
++
++  CHECK(rejects("speed_set", {{"speed", SPEED_MIN - 1}}));
++  CHECK(rejects("speed_set", {{"speed", emulation_speed_max + 1}}));
++  CHECK(ok_result("speed_set", {{"speed", SPEED_NORMAL}}).at("speed") ==
++        SPEED_NORMAL);
++}
++
++// --- joystick --------------------------------------------------------------
++
++TEST_CASE("Agent: joy_axis puts each stick where it was told") {
++  HeadlessHarness_t harness;
++
++  const JoystickSaveState_t rest = joystick_state();
++  CHECK(rest.x_pos[0] == 127);
++  CHECK(rest.y_pos[1] == 127);
++
++  ok_result("joy_axis", {{"axis", 0}, {"value", 0}});
++  ok_result("joy_axis", {{"axis", 1}, {"value", 255}});
++  ok_result("joy_axis", {{"axis", 2}, {"value", 40}});
++  ok_result("joy_axis", {{"axis", 3}, {"value", 200}});
++
++  const JoystickSaveState_t moved = joystick_state();
++  CHECK(moved.x_pos[0] == 0);
++  CHECK(moved.y_pos[0] == 255);
++  // The second stick is its own. Driving trim instead of position folded these
++  // two onto the first stick's axes, and both sticks moved together.
++  CHECK(moved.x_pos[1] == 40);
++  CHECK(moved.y_pos[1] == 200);
++
++  // Trim is the user's calibration, and no amount of stick movement touches it.
++  CHECK(moved.trim_x == 0);
++  CHECK(moved.trim_y == 0);
++}
++
++TEST_CASE("Agent: joy_axis takes a position, not a nudge") {
++  HeadlessHarness_t harness;
++
++  CHECK(rejects("joy_axis", {{"axis", 0}}));  // a missing value is not centre
++  CHECK(rejects("joy_axis", {{"axis", 0}, {"value", -1}}));
++  CHECK(rejects("joy_axis", {{"axis", 0}, {"value", 256}}));
++  CHECK(rejects("joy_axis", {{"axis", 4}, {"value", 127}}));
++
++  // A refused call leaves the sticks alone.
++  const JoystickSaveState_t after = joystick_state();
++  CHECK(after.x_pos[0] == 127);
++  CHECK(after.y_pos[0] == 127);
++}
++
++TEST_CASE("Agent: joy_button covers the three the machine has") {
++  HeadlessHarness_t harness;
++
++  for (int button = 0; button <= 2; ++button) {
++    ok_result("joy_button", {{"button", button}, {"down", true}});
++  }
++  const JoystickSaveState_t pressed = joystick_state();
++  CHECK(pressed.buttons[0] == 1);
++  CHECK(pressed.buttons[1] == 1);
++  CHECK(pressed.buttons[2] == 1);
++
++  ok_result("joy_button", {{"button", 1}, {"down", false}});
++  CHECK(joystick_state().buttons[1] == 0);
++
++  // There is no fourth button: the peripheral dropped it and the call still
++  // answered ok, which read as a press that never happened.
++  CHECK(rejects("joy_button", {{"button", 3}, {"down", true}}));
++}
++
++TEST_CASE("Agent: input lands when the machine next runs") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++  run_program(0x0300, program_idle);
++
++  ok_result("joy_axis", {{"axis", 0}, {"value", 0}});
++  // Queued, not applied: the peripheral has not been asked to think yet.
++  CHECK(joystick_state_raw().x_pos[0] == 127);
++
++  ok_result("run_frames", {{"frames", 1}});
++  CHECK(joystick_state_raw().x_pos[0] == 0);
++}
++
++TEST_CASE("Agent: a program sees an input on the frame after it was sent") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++  run_program(0x0300, program_watch_keyboard);
++
++  ok_result("run_frames", {{"frames", 2}});
++  const uint8_t* cell = mem_get_main_ptr(0x0400);
++  REQUIRE(cell != nullptr);
++  CHECK((*cell & 0x80) == 0);  // nothing pressed yet
++
++  ok_result("key_state", {{"key", 0x41}, {"down", true}});
++
++  // The queue is drained after a frame's cycles have already been run, so the
++  // program cannot see this key during the frame that delivers it.
++  ok_result("run_frames", {{"frames", 1}});
++  CHECK((*cell & 0x80) == 0);
++
++  // The frame after is where it shows up, latched with the high bit set.
++  ok_result("run_frames", {{"frames", 1}});
++  CHECK(*cell == 0xC1);
++}
++
++TEST_CASE("Agent: a keystroke does not move the joystick") {
++  HeadlessHarness_t harness;
++
++  ok_result("joy_button", {{"button", 1}, {"down", true}});
++  CHECK(joystick_state().buttons[1] == 1);
++
++  // Slot 0 is shared and the command ids overlap: a keyboard event carries the
++  // same id as a joystick button press, and every peripheral in the slot is
++  // offered every command. Read as a button payload, key code $01 is button 1
++  // and the byte after it - the high half of a 32-bit key - is a release.
++  ok_result("key_state", {{"key", 0x01}, {"down", true}});
++  CHECK(joystick_state().buttons[1] == 1);
++
++  ok_result("joy_axis", {{"axis", 0}, {"value", 90}});
++  ok_result("key_type", {{"text", "AB"}, {"frames_between", 1}});
++  CHECK(joystick_state().x_pos[0] == 90);
++}
++
++// --- screen hash -----------------------------------------------------------
++
++TEST_CASE("Agent: screen_hash watches the text page in text mode") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++
++  const Json described = ok_result("screen_hash");
++  CHECK(described.at("source").get<std::string>() == "text");
++  CHECK(described.at("page").get<int>() == 1);
++
++  const uint64_t before = screen_hash();
++  poke(0x0400, 0xC1);
++  CHECK(screen_hash() != before);
++
++  // The hi-res page is not what the machine is showing, so churn there must
++  // not read as a screen that changed.
++  const uint64_t settled = screen_hash();
++  poke(0x2000, 0xFF);
++  poke(0x3FFF, 0xFF);
++  CHECK(screen_hash() == settled);
++
++  // $0478 is one of the 64 screen holes the rows skip. Peripherals use them as
++  // scratch, so folding them in would leave a wait that never settles.
++  poke(0x0478, 0x55);
++  CHECK(screen_hash() == settled);
++  poke(0x0478, 0xAA);
++  CHECK(screen_hash() == settled);
++}
++
++TEST_CASE("Agent: screen_hash watches the hi-res page in graphics mode") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++  touch_switch(0xC050);  // graphics
++  touch_switch(0xC057);  // hi-res
++
++  const Json described = ok_result("screen_hash");
++  CHECK(described.at("source").get<std::string>() == "hires");
++
++  const uint64_t before = screen_hash();
++  poke(0x2000, 0x2A);
++  CHECK(screen_hash() != before);
++
++  const uint64_t settled = screen_hash();
++  poke(0x0400, 0xC2);
++  CHECK(screen_hash() == settled);
++}
++
++TEST_CASE("Agent: screen_hash stays on hi-res in mixed mode") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++  touch_switch(0xC050);  // graphics
++  touch_switch(0xC057);  // hi-res
++  touch_switch(0xC053);  // mixed: four text rows under the picture
++
++  // Deliberate. A hi-res game treats the text page as scratch RAM, so a hash
++  // that folded it in would report a screen that never stops moving.
++  const Json described = ok_result("screen_hash");
++  CHECK(described.at("source").get<std::string>() == "hires");
++  const uint64_t settled = screen_hash();
++  poke(0x0400, 0xC3);
++  poke(0x07F8, 0xC4);
++  CHECK(screen_hash() == settled);
++}
++
++TEST_CASE("Agent: screen_hash follows the displayed page") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++
++  const uint64_t page1 = screen_hash();
++  poke(0x0800, 0xC5);  // page 2, not displayed yet
++  CHECK(screen_hash() == page1);
++
++  touch_switch(0xC055);  // page 2
++  const Json described = ok_result("screen_hash");
++  CHECK(described.at("page").get<int>() == 2);
++  const uint64_t settled = screen_hash();
++  poke(0x0801, 0xC6);
++  CHECK(screen_hash() != settled);
++
++  // And the page we left behind is now the one that may churn freely.
++  const uint64_t after = screen_hash();
++  poke(0x0401, 0xC7);
++  CHECK(screen_hash() == after);
++}
++
++// --- waiting for the screen ------------------------------------------------
++
++TEST_CASE("Agent: run_until_change spends its whole budget on a still screen") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++  run_program(0x0300, program_idle);
++
++  const Json result = ok_result("run_until_change", wait_params(12, 4));
++  CHECK_FALSE(result.at("changed").get<bool>());
++  CHECK(result.at("frames").get<int>() == 12);
++  CHECK(result.at("cycles").get<uint64_t>() > 0);
++}
++
++TEST_CASE("Agent: run_until_change returns once the screen settles") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++  const uint64_t before = screen_hash();
++  run_program(0x0300, program_draw_once);
++
++  // The change lands in the first chunk; two quiet chunks then satisfy
++  // `stable`, so the wait ends well inside its budget instead of running it
++  // out — which is the whole point of asking to wait rather than to run.
++  const Json result = ok_result("run_until_change", wait_params(400, 4));
++  CHECK(result.at("changed").get<bool>() == true);
++  CHECK(result.at("frames").get<int>() == 12);
++  CHECK(result.at("hash").get<uint64_t>() != before);
++  CHECK(result.at("hash").get<uint64_t>() == screen_hash());
++}
++
++TEST_CASE("Agent: run_until_change gives up on a screen that never settles") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++  run_program(0x0300, program_draw_forever);
++
++  const Json result = ok_result("run_until_change", wait_params(12, 4));
++  CHECK(result.at("changed").get<bool>() == true);
++  CHECK(result.at("frames").get<int>() == 12);
++}
++
++TEST_CASE("Agent: run_until_change refuses a budget it cannot honour") {
++  HeadlessHarness_t harness;
++
++  CHECK(rejects("run_until_change", {{"max_frames", -1}}));
++  CHECK(rejects("run_until_change", {{"max_frames", 60 * 60 * 10 + 1}}));
++  CHECK(rejects("run_until_change", {{"max_frames", 8}, {"chunk", 0}}));
++  CHECK(rejects("run_until_change", {{"max_frames", 8}, {"chunk", -4}}));
++}
++
++// --- the input log ---------------------------------------------------------
++
++TEST_CASE("Agent: nothing is logged until a client asks for it") {
++  HeadlessHarness_t harness;
++  agent_input_set_capture(false, 0);
++
++  record_key(0x41, true);
++  agent_input_record_joy_axis(0, 200);
++
++  const Json result = ok_result("input_poll");
++  CHECK(result.at("capturing").get<bool>() == false);
++  CHECK(result.at("events").empty());
++}
++
++TEST_CASE("Agent: input_poll hands over what the window did") {
++  HeadlessHarness_t harness;
++  ok_result("input_capture", {{"on", true}});
++
++  // What the frontends call when a person types and moves the stick.
++  record_key(0x41, true);
++  record_key(0x41, false);
++  agent_input_record_joy_axis(2, 200);
++  agent_input_record_joy_button(1, true);
++
++  const Json result = ok_result("input_poll");
++  const Json& events = result.at("events");
++  REQUIRE(events.size() == 4);
++  CHECK(events.at(0).at("kind").get<std::string>() == "key");
++  CHECK(events.at(0).at("code").get<int>() == 0x41);
++  CHECK(events.at(0).at("value").get<int>() == 1);
++  CHECK(events.at(1).at("value").get<int>() == 0);
++  CHECK(events.at(2).at("kind").get<std::string>() == "joy_axis");
++  CHECK(events.at(2).at("code").get<int>() == 2);
++  CHECK(events.at(2).at("value").get<int>() == 200);
++  CHECK(events.at(3).at("kind").get<std::string>() == "joy_button");
++  CHECK(events.at(3).at("code").get<int>() == 1);
++
++  // Polling takes them off, so the next poll is empty rather than a repeat.
++  CHECK(ok_result("input_poll").at("events").empty());
++  agent_input_set_capture(false, 0);
++}
++
++TEST_CASE("Agent: only keys a client could send back are logged") {
++  HeadlessHarness_t harness;
++  ok_result("input_capture", {{"on", true}});
++
++  // The arrows arrive as LinAppleKey values a client cannot send, so they are
++  // folded onto the control codes the protocol documents for them.
++  record_key(0x100, true);  // up
++  record_key(0x101, true);  // down
++  record_key(0x102, true);  // left
++  record_key(0x103, true);  // right
++  // Function keys and modifiers never reach the Apple II as keystrokes.
++  record_key(0x200, true);  // F1
++  record_key(0x400, true);  // left shift
++  record_key(0, true);
++
++  const Json events = ok_result("input_poll").at("events");
++  REQUIRE(events.size() == 4);
++  CHECK(events.at(0).at("code").get<int>() == 0x0B);
++  CHECK(events.at(1).at("code").get<int>() == 0x0A);
++  CHECK(events.at(2).at("code").get<int>() == 0x08);
++  CHECK(events.at(3).at("code").get<int>() == 0x15);
++  agent_input_set_capture(false, 0);
++}
++
++TEST_CASE("Agent: what is logged is the byte the machine will see") {
++  HeadlessHarness_t harness;
++  ok_result("input_capture", {{"on", true}});
++
++  // Shift is not something a client can send. It changes what the key held
++  // with it turns into, and only the keyboard knows into what - so the log has
++  // to carry the result, not the key the frontend named.
++  record_key('p', true, /*shift=*/true);
++  record_key('p', false);  // shift let go first, as a person's hand does
++  record_key('8', true, /*shift=*/true);
++  record_key('[', true, /*shift=*/false, /*ctrl=*/true);
++
++  const Json events = ok_result("input_poll").at("events");
++  REQUIRE(events.size() == 4);
++  CHECK(events.at(0).at("code").get<int>() == 'P');
++  // The release names the byte its press did, or a movie would be holding down
++  // a key it never pressed.
++  CHECK(events.at(1).at("code").get<int>() == 'P');
++  CHECK(events.at(1).at("value").get<int>() == 0);
++  CHECK(events.at(2).at("code").get<int>() == '*');
++  CHECK(events.at(3).at("code").get<int>() == 0x1B);  // ctrl-[ is escape
++  agent_input_set_capture(false, 0);
++}
++
++TEST_CASE("Keyboard: the translate query answers without pressing anything") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++  run_program(0x0300, program_watch_keyboard);
++
++  KeyboardTranslate_t request{};
++  request.event = key_event('1', true, /*shift=*/true);
++  size_t size = sizeof(request);
++  REQUIRE(peripheral_query(0, keyboard_query_translate, &request, &size) ==
++          peripheral_ok);
++  CHECK(request.latched == 1U);
++  CHECK(request.key == '!');
++
++  // A key the machine never gets: a function key has no byte to latch.
++  request.event = key_event(0x200, true);
++  size = sizeof(request);
++  REQUIRE(peripheral_query(0, keyboard_query_translate, &request, &size) ==
++          peripheral_ok);
++  CHECK(request.latched == 0U);
++
++  // Asking is not pressing: the program watching $C000 still sees nothing.
++  ok_result("run_frames", {{"frames", 2}});
++  const uint8_t* cell = mem_get_main_ptr(0x0400);
++  REQUIRE(cell != nullptr);
++  CHECK((*cell & 0x80) == 0);
++}
++
++TEST_CASE("Agent: a full buffer says how much it lost") {
++  HeadlessHarness_t harness;
++  ok_result("input_capture", {{"on", true}, {"limit", 4}});
++
++  for (int i = 0; i < 10; ++i) {
++    agent_input_record_joy_axis(0, i);
++  }
++
++  const Json result = ok_result("input_poll");
++  const Json& events = result.at("events");
++  REQUIRE(events.size() == 4);
++  // The oldest go first: a recorder still has a use for the newest input.
++  CHECK(events.at(0).at("value").get<int>() == 6);
++  CHECK(events.at(3).at("value").get<int>() == 9);
++  CHECK(result.at("dropped").get<int>() == 6);
++
++  // Re-arming starts a clean count.
++  ok_result("input_capture", {{"on", true}});
++  CHECK(ok_result("input_poll").at("dropped").get<int>() == 0);
++  agent_input_set_capture(false, 0);
++}
++
++TEST_CASE("Agent: the input log stamps the cycle it happened on") {
++  HeadlessHarness_t harness;
++  select_text_page1();
++  run_program(0x0300, program_idle);
++  ok_result("input_capture", {{"on", true}});
++
++  record_key(0x41, true);
++  ok_result("run_frames", {{"frames", 10}});
++  record_key(0x41, false);
++
++  const Json events = ok_result("input_poll").at("events");
++  REQUIRE(events.size() == 2);
++  const auto first = events.at(0).at("cycles").get<uint64_t>();
++  const auto second = events.at(1).at("cycles").get<uint64_t>();
++  CHECK(second > first);
++  // Ten frames of cycles passed between them, which is how a recorder turns a
++  // cycle stamp back into a frame number.
++  CHECK((second - first) > 10 * 17000);
++  agent_input_set_capture(false, 0);
++}
++
++TEST_CASE("Agent: audio_dump starts, reports and stops") {
++  HeadlessHarness_t harness;
++
++  // Nothing is being recorded until someone asks.
++  Json result = ok_result("audio_dump", {{"on", false}});
++  CHECK(result.at("dumping").get<bool>() == false);
++  CHECK(result.at("path").get<std::string>().empty());
++
++  // A recording needs somewhere to go.
++  CHECK(rejects("audio_dump", {{"on", true}}));
++
++  result = ok_result("audio_dump", {{"on", true}, {"path", "/tmp/sound.wav"}});
++  CHECK(result.at("dumping").get<bool>() == true);
++  CHECK(result.at("path").get<std::string>() == "/tmp/sound.wav");
++
++  // A frontend that cannot record has to say so rather than let the caller
++  // believe a file is being written.
++  CHECK(rejects("audio_dump", {{"on", true}, {"path", "/nowhere/at/all.wav"}}));
++
++  result = ok_result("audio_dump", {{"on", false}});
++  CHECK(result.at("dumping").get<bool>() == false);
++}
++
++TEST_CASE("Agent: the input commands check their sizes") {
++  HeadlessHarness_t harness;
++
++  CHECK(rejects("input_capture", {{"on", true}, {"limit", -1}}));
++  CHECK(rejects("input_capture", {{"on", true}, {"limit", (1 << 20) + 1}}));
++  CHECK(rejects("input_poll", {{"max", 0}}));
++  CHECK(rejects("input_poll", {{"max", -1}}));
++  CHECK(rejects("input_poll", {{"max", (1 << 20) + 1}}));
++  agent_input_set_capture(false, 0);
++}
++
++// --- socket framing --------------------------------------------------------
++
++TEST_CASE("Agent server: one line in, one line out") {
++  AgentSocketFixture_t socket_fixture;
++  socket_fixture.start();
++  socket_fixture.connect_client();
++
++  // Two requests in a single write: a client is entitled to pipeline, and the
++  // blank line and the \r\n ending must not cost it a reply.
++  socket_fixture.send_raw(
++      "{\"cmd\":\"ping\",\"id\":1}\r\n"
++      "\n"
++      "{\"cmd\":\"nope\",\"id\":2}\n");
++
++  const std::vector<std::string> replies = socket_fixture.collect_replies(2);
++  REQUIRE(replies.size() == 2);
++
++  const Json first = Json::parse(replies.at(0), nullptr, false);
++  REQUIRE_FALSE(first.is_discarded());
++  CHECK(first.at("id").get<int>() == 1);
++  CHECK(first.at("ok").get<bool>() == true);
++
++  const Json second = Json::parse(replies.at(1), nullptr, false);
++  REQUIRE_FALSE(second.is_discarded());
++  CHECK(second.at("id").get<int>() == 2);
++  CHECK(second.at("ok").get<bool>() == false);
++
++  CHECK(agent_server_client_count() == 1);
++}
++
++TEST_CASE("Agent server: garbage on the wire does not cost the connection") {
++  AgentSocketFixture_t socket_fixture;
++  socket_fixture.start();
++  socket_fixture.connect_client();
++
++  socket_fixture.send_raw("this is not json\n{\"cmd\":\"ping\",\"id\":9}\n");
++  const std::vector<std::string> replies = socket_fixture.collect_replies(2);
++  REQUIRE(replies.size() == 2);
++  CHECK(Json::parse(replies.at(0)).at("ok").get<bool>() == false);
++  CHECK(Json::parse(replies.at(1)).at("id").get<int>() == 9);
++  CHECK(agent_server_client_count() == 1);
++}
++
++TEST_CASE("Agent server: a request line past the cap drops the client") {
++  AgentSocketFixture_t socket_fixture;
++  socket_fixture.start();
++  socket_fixture.connect_client();
++
++  // No newline, so nothing is ever dispatched and the buffer just grows. The
++  // cap is what stops one client from spending the emulator's memory; the
++  // largest legitimate request, a 64 KB mem_write, is nowhere near it.
++  const std::string blob(64 * 1024, 'x');
++  size_t sent_total = 0;
++  constexpr size_t give_up_after = 6 * 1024 * 1024;
++  while (agent_server_client_count() > 0 && sent_total < give_up_after) {
++    const ssize_t written =
++        send(socket_fixture.fd, blob.data(), blob.size(), MSG_NOSIGNAL);
++    if (written > 0) {
++      sent_total += static_cast<size_t>(written);
++    } else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
++      break;
++    }
++    agent_server_poll(0);
++  }
++
++  CHECK(sent_total > 4 * 1024 * 1024);
++  CHECK(sent_total < give_up_after);
++  CHECK(agent_server_client_count() == 0);
++}
++
++TEST_CASE("Agent server: stopping releases the socket path") {
++  AgentSocketFixture_t socket_fixture;
++  socket_fixture.start();
++  CHECK(access(socket_fixture.path.c_str(), F_OK) == 0);
++
++  socket_fixture.connect_client();
++  agent_server_stop();
++
++  CHECK_FALSE(agent_server_is_active());
++  CHECK(agent_server_client_count() == 0);
++  // A path left behind would make the next session's bind() fail.
++  CHECK(access(socket_fixture.path.c_str(), F_OK) != 0);
++
++  // Starting again on the same path is the restart case, and it works.
++  socket_fixture.start();
++}
+-- 
+2.53.0
+

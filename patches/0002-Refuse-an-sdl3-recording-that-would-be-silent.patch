@@ -1,0 +1,89 @@
+From 5c1f06e4ef11977cc676779e7d13156ddbf2993b Mon Sep 17 00:00:00 2001
+From: zirize <zirize@gmail.com>
+Date: Fri, 18 Sep 2026 13:58:31 +0900
+Subject: [PATCH 2/9] Refuse an sdl3 recording that would be silent
+
+The mixer's samples reach the dumper from the sound card's callback, so a
+session that never opened a device would write a WAV of nothing at all,
+and a silent file cannot be told apart from a machine that made no sound.
+That is already why the frontends with no audio path of their own refuse
+outright; the SDL3 frontend without a device is the same case.
+
+frontend_audio_dump_start now says no when there is no stream, and ds_init
+opens the device before initialising the dumper, so a file named with
+--audio-dump is reported as not recorded instead of being created empty.
+
+Checked both ways: with a device, two seconds of audio_dump wrote 360,492
+bytes; with SDL_OpenAudioDeviceStream made to fail, the command answered
+ok:false and the command line printed "audio: no device, not recording
+to ..." - neither left a file behind.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/frontends/sdl3/Main.cpp | 32 ++++++++++++++++++++++++--------
+ 1 file changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/src/frontends/sdl3/Main.cpp b/src/frontends/sdl3/Main.cpp
+index 9852ac4..37a20b2 100644
+--- a/src/frontends/sdl3/Main.cpp
++++ b/src/frontends/sdl3/Main.cpp
+@@ -54,13 +54,21 @@ static void SDLCALL sdl3_audio_callback(void* userdata, SDL_AudioStream* stream,
+ 
+ // Starting and stopping the recording while the machine runs, rather than only
+ // from the command line. What is dumped here is the mixer's output - the same
+-// thing the sound card is playing, Mockingboard included - which is not quite
+-// what the headless frontend writes, where there is no mixer and the samples
+-// come straight from the speaker.
++// thing the sound card is playing - which is not quite what the headless
++// frontend writes, where there is no mixer and the samples come straight from
++// the speaker. In practice the two carry the same sound: the mixer's other
++// input is the Mockingboard, which is unfinished and makes none.
+ auto frontend_audio_dump_start(const char* path) -> bool {
+   if (path == nullptr || *path == '\0') {
+     return false;
+   }
++  // Samples reach the dumper from the sound card's callback and nowhere else,
++  // so with no device open the file would stay silent. Refusing is the same
++  // answer the frontends without an audio path give: a silent file cannot be
++  // told apart from a machine that made no sound.
++  if (g_audioStream == nullptr) {
++    return false;
++  }
+   frontend_audio_dump_stop();
+   if (audio_dumper_initialize(&g_audio_dumper, path, SPKR_SAMPLE_RATE, 2) !=
+       0) {
+@@ -89,18 +97,26 @@ auto ds_init() -> bool {
+   desired.channels = 2;
+   desired.format = SDL_AUDIO_S16;
+ 
+-  if (!g_audio_dump_file.empty()) {
+-    audio_dumper_initialize(&g_audio_dumper, g_audio_dump_file.c_str(),
+-                            SPKR_SAMPLE_RATE, 2);
+-  }
+-
+   g_audioStream =
+       SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired,
+                                 sdl3_audio_callback, nullptr);
+   if (!g_audioStream) {
++    // Same reason as above: the command line asked for a recording we cannot
++    // fill, so say so rather than leave an empty WAV behind.
++    if (!g_audio_dump_file.empty()) {
++      fprintf(stderr, "audio: no device, not recording to %s\n",
++              g_audio_dump_file.c_str());
++      g_audio_dump_file.clear();
++    }
+     return false;
+   }
+ 
++  // Only once the device is open, because that callback is what fills it.
++  if (!g_audio_dump_file.empty()) {
++    audio_dumper_initialize(&g_audio_dumper, g_audio_dump_file.c_str(),
++                            SPKR_SAMPLE_RATE, 2);
++  }
++
+   SDL_ResumeAudioStreamDevice(g_audioStream);
+   g_ds_available = true;
+ 
+-- 
+2.53.0
+

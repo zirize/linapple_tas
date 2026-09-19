@@ -1,0 +1,161 @@
+From b22809c8de72f193010318b4f19795b3a501d051 Mon Sep 17 00:00:00 2001
+From: zirize <zirize@gmail.com>
+Date: Fri, 18 Sep 2026 14:17:47 +0900
+Subject: [PATCH 3/9] Test that a state comes back and that a run repeats
+
+Everything the recorder does rests on two things nothing checked: that a save
+state puts the machine back where it was, and that the same state with the
+same inputs runs the same way. Both were only ever seen working in a real
+game, which is the slowest possible place to notice they had stopped.
+
+The first case saves while the screen is still moving - a state that only
+looked restored because nothing was happening would pass otherwise - then runs
+on, loads, and finds the same screen hash, the same screen byte and the
+program back where it was parked.
+
+The second plays a short script of held keys and frame counts, loads the state
+and plays it again, and compares the cycle counts as well as the screen: the
+cycles move first when a run drifts. It ends with a different key to show the
+comparison can fail, because a machine that ignored its input would otherwise
+satisfy it.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ tests/test_agent_commands.cpp | 114 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 114 insertions(+)
+
+diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
+index 321b681..1fedd48 100644
+--- a/tests/test_agent_commands.cpp
++++ b/tests/test_agent_commands.cpp
+@@ -319,6 +319,36 @@ struct AgentSocketFixture_t {
+   }
+ };
+ 
++// A save state is a file, so a test that writes one needs somewhere to put it
++// that is not the working directory - a leftover state would be picked up by
++// whatever runs next.
++struct StateFileFixture_t {
++  std::string directory;
++  std::string path;
++
++  StateFileFixture_t() {
++    const char* tmpdir = getenv("TMPDIR");
++    const std::string base =
++        (tmpdir != nullptr && tmpdir[0] != '\0') ? tmpdir : "/tmp";
++    std::string pattern = base + "/linapple-state-XXXXXX";
++    std::vector<char> buffer(pattern.begin(), pattern.end());
++    buffer.push_back('\0');
++    REQUIRE(mkdtemp(buffer.data()) != nullptr);
++    directory = buffer.data();
++    path = directory + "/machine.state";
++  }
++
++  ~StateFileFixture_t() {
++    unlink(path.c_str());
++    rmdir(directory.c_str());
++  }
++
++  StateFileFixture_t(const StateFileFixture_t&) = delete;
++  auto operator=(const StateFileFixture_t&) -> StateFileFixture_t& = delete;
++  StateFileFixture_t(StateFileFixture_t&&) = delete;
++  auto operator=(StateFileFixture_t&&) -> StateFileFixture_t& = delete;
++};
++
+ }  // namespace
+ 
+ // --- malformed input -------------------------------------------------------
+@@ -912,6 +942,90 @@ TEST_CASE("Agent: the input commands check their sizes") {
+   agent_input_set_capture(false, 0);
+ }
+ 
++// --- save states and repeating a run ---------------------------------------
++
++TEST_CASE("Agent: a save state puts the machine back where it was") {
++  HeadlessHarness_t harness;
++  StateFileFixture_t state_file;
++  select_text_page1();
++  // A screen that never stops moving is the honest case: if loading a state
++  // only looked right because nothing was happening, this would not catch it.
++  run_program(0x0300, program_draw_forever);
++
++  ok_result("run_frames", {{"frames", 4}});
++  const uint64_t marked = screen_hash();
++  const uint8_t marked_cell = *mem_get_main_ptr(0x0400);
++
++  const Json saved = ok_result("state_save", {{"path", state_file.path}});
++  CHECK(saved.at("path").get<std::string>() == state_file.path);
++
++  ok_result("run_frames", {{"frames", 32}});
++  REQUIRE(screen_hash() != marked);
++
++  const Json loaded = ok_result("state_load", {{"path", state_file.path}});
++  CHECK(loaded.at("path").get<std::string>() == state_file.path);
++  CHECK(screen_hash() == marked);
++  CHECK(*mem_get_main_ptr(0x0400) == marked_cell);
++  CpuRegisters_t* regs = cpu_get_registers();
++  REQUIRE(regs != nullptr);
++  CHECK(regs->pc >= 0x0300);
++  CHECK(regs->pc <= 0x0305);
++}
++
++TEST_CASE("Agent: the same state and the same inputs run the same way") {
++  HeadlessHarness_t harness;
++  StateFileFixture_t state_file;
++  select_text_page1();
++  // The program copies the keyboard latch to the screen, so the run's result
++  // depends on the inputs rather than only on the number of frames.
++  run_program(0x0300, program_watch_keyboard);
++  ok_result("state_save", {{"path", state_file.path}});
++
++  struct Run_t {
++    std::vector<uint64_t> cycles;
++    uint64_t hash = 0;
++    uint8_t cell = 0;
++  };
++
++  // Held rather than tapped: a press and release delivered in the same batch
++  // would be gone again before the machine next runs, and the point here is
++  // that the run depends on the input.
++  const std::vector<std::pair<int, int>> script = {
++      {0x41, 6}, {0x42, 13}, {0x43, 5}};
++
++  auto play = [&]() -> Run_t {
++    Run_t run;
++    for (size_t i = 0; i < script.size(); ++i) {
++      ok_result("key_state", {{"key", script.at(i).first}, {"down", true}});
++      run.cycles.push_back(ok_result("run_frames",
++                                     {{"frames", script.at(i).second},
++                                      {"deterministic", true}})
++                               .at("cycles")
++                               .get<uint64_t>());
++    }
++    run.hash = screen_hash();
++    run.cell = *mem_get_main_ptr(0x0400);
++    return run;
++  };
++
++  const Run_t first = play();
++  ok_result("state_load", {{"path", state_file.path}});
++  const Run_t second = play();
++
++  // Cycle counts are the sharper test: a difference shows up there before the
++  // screen has had a chance to drift.
++  CHECK(second.cycles == first.cycles);
++  CHECK(second.hash == first.hash);
++  CHECK(second.cell == first.cell);
++
++  // And a run that is given different input must not land on the same numbers,
++  // or the check above would pass for a machine that ignores what it is told.
++  ok_result("state_load", {{"path", state_file.path}});
++  ok_result("key_state", {{"key", 0x50}, {"down", true}});
++  ok_result("run_frames", {{"frames", 6}});
++  CHECK(*mem_get_main_ptr(0x0400) != first.cell);
++}
++
+ // --- socket framing --------------------------------------------------------
+ 
+ TEST_CASE("Agent server: one line in, one line out") {
+-- 
+2.53.0
+
