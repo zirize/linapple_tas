@@ -9,6 +9,13 @@
 control channel — plus the tests for it, and fix what those tests found. They
 are `git format-patch` output, so `git am` applies them.
 
+> **They apply to commit `011add9`, not to upstream `master`.** Upstream has
+> moved on: as of 2026-09-20 it is 73 commits ahead of that base, and `0001`
+> no longer applies to the tip — four files conflict (`src/core/LinAppleCore.cpp`,
+> `src/frontends/common/sdl/JoystickFrontend.cpp`, and both frontend `Main.cpp`).
+> Check the base out first, as below. Rebasing the series onto current `master`
+> is work nobody has done yet.
+
 | | |
 |---|---|
 | 0001 | the agent socket control channel |
@@ -29,7 +36,8 @@ are `git format-patch` output, so `git am` applies them.
 ## Apply and build
 
 ```bash
-git clone <linapple> && cd linapple
+git clone https://github.com/linappleii/linapple.git && cd linapple
+git checkout 011add9        # the base these patches were made against
 git am /path/to/linapple_tas/patches/*.patch
 
 # windowed, for watching a session
