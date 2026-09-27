@@ -1,4 +1,4 @@
-From 32e8d8ee1c7b50e0f77083685145c8fe68e89bdb Mon Sep 17 00:00:00 2001
+From 40288283c282c9ae3be532ae6c361721f346a69d Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Fri, 18 Sep 2026 14:44:38 +0900
 Subject: [PATCH 6/9] Close the last four gaps in the agent tests
@@ -35,7 +35,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  1 file changed, 239 insertions(+), 10 deletions(-)
 
 diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
-index 0bfc53f..160f416 100644
+index 9378a67..9076b5b 100644
 --- a/tests/test_agent_commands.cpp
 +++ b/tests/test_agent_commands.cpp
 @@ -140,6 +140,39 @@ auto select_text_page1() -> void {

@@ -1,4 +1,4 @@
-From 8dee5e12fb3daa4b8852cd6d3b7660cc0f05649c Mon Sep 17 00:00:00 2001
+From 1f5508eff74c75babafb99402529fcbda5f83395 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 01:48:39 +0900
 Subject: [PATCH 9/9] Read the screen off a real program, and say what a run
@@ -179,7 +179,7 @@ index 2c60787..6358cbd 100644
    }
  
 diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
-index 4d31447..3d6961f 100644
+index dd07391..b8a22fb 100644
 --- a/tests/test_agent_commands.cpp
 +++ b/tests/test_agent_commands.cpp
 @@ -17,6 +17,9 @@

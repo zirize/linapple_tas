@@ -1,4 +1,4 @@
-From f4b13be878747749b0493965cae656fb5ec37684 Mon Sep 17 00:00:00 2001
+From 79c398a1236fc455acebc64ba4083f3ca66a7d37 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Fri, 18 Sep 2026 14:27:23 +0900
 Subject: [PATCH 4/9] Stop slot 0 peripherals answering each other's commands

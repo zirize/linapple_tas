@@ -1,4 +1,4 @@
-From 1c2f2c92e0d9326ad2a55a833165ab6e70e5d746 Mon Sep 17 00:00:00 2001
+From dec14ae8c5d1ef39f12e5ef95591a9164dcbe7b1 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 01:40:44 +0900
 Subject: [PATCH 8/9] Mark a page an agent write changed, and ask the 6502
@@ -137,7 +137,7 @@ index a1349e7..2c60787 100644
      Json result;
      result["written"] = bytes.size();
 diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
-index 9bcc45c..4d31447 100644
+index 8dba521..dd07391 100644
 --- a/tests/test_agent_commands.cpp
 +++ b/tests/test_agent_commands.cpp
 @@ -167,16 +167,27 @@ auto base64_decode(const std::string& text) -> std::vector<uint8_t> {

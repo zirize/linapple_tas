@@ -1,4 +1,4 @@
-From 3c3a8369bd107f963d10d547dad76acd66795d43 Mon Sep 17 00:00:00 2001
+From 7576ca34399896a7abbb93732bd041fc326f2c54 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Fri, 18 Sep 2026 13:58:31 +0900
 Subject: [PATCH 2/9] Refuse an sdl3 recording that would be silent

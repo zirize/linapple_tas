@@ -1,4 +1,4 @@
-From 0047684173d1665d737a1b024b9e1ddd43fa2537 Mon Sep 17 00:00:00 2001
+From 7624e21bea26a60d903e081410b8bf5f5873cee4 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 00:36:36 +0900
 Subject: [PATCH 7/9] Let a caller read the memory the program is actually
@@ -126,7 +126,7 @@ index 528f139..a1349e7 100644
    }
  
 diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
-index 160f416..9bcc45c 100644
+index 9076b5b..8dba521 100644
 --- a/tests/test_agent_commands.cpp
 +++ b/tests/test_agent_commands.cpp
 @@ -482,6 +482,39 @@ TEST_CASE("Agent: mem_read returns what memory holds") {

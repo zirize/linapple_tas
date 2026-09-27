@@ -10,10 +10,12 @@ control channel — plus the tests for it, and fix what those tests found. They
 are `git format-patch` output, so `git am` applies them.
 
 > **They are against upstream `master` at `3c00687` (2026-09-20).** A fresh
-> clone of `master` plus these nine gives the same tree hash as the branch they
-> were made from, and from that tree the tests are 56/56 and both frontends
-> pass `dev/smoke.sh` 9/9. If upstream has moved again since and a patch
-> refuses, `git checkout 3c00687` first and the series applies as it did here.
+> clone plus these nine gives tree hash `a58c66d`, the same as the branch they
+> were made from. From that tree `ctest` is **65/65** (the base is 64; the
+> series adds `test-agent-commands`), **all five frontends build with 0
+> errors** — sdl1, sdl2, sdl3, tui, headless — and sdl3 and headless each pass
+> `dev/smoke.sh` 9/9. If upstream has moved again since and a patch refuses,
+> `git checkout 3c00687` first and the series applies as it did here.
 
 | | |
 |---|---|
@@ -31,6 +33,10 @@ are `git format-patch` output, so `git am` applies them.
 
 `cmake`, `libsdl3-dev`, `libsdl3-image-dev`, `libcurl4-openssl-dev`,
 `libzip-dev`, `zlib1g-dev`, `nlohmann-json3-dev`, `imagemagick`.
+
+The sdl1 and sdl2 frontends additionally need `libsdl1.2-dev`,
+`libsdl-image1.2-dev`, `libsdl2-dev` and `libsdl2-image-dev`. They are not
+needed for the headless or sdl3 builds below.
 
 ## Apply and build
 

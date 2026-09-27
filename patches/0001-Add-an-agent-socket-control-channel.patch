@@ -1,4 +1,4 @@
-From 85ab0a8cc37fe3e390b8235bedea58936e9f0ae4 Mon Sep 17 00:00:00 2001
+From 7eb2d5db2ad00fd49813f115234213438670b9e6 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Fri, 18 Sep 2026 13:42:14 +0900
 Subject: [PATCH 1/9] Add an agent socket control channel
