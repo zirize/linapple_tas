@@ -43,12 +43,12 @@ the machine did the arithmetic. everything is wired up.
 ```
 
 Building the patched emulator: [docs/build.md](docs/build.md). The patches are
-against upstream `master` at `3c00687`.
+against upstream `master` at `86bee1c`.
 
 ## What is here
 
 ```
-patches/     nine commits against LinApple: the socket, its tests, and the
+patches/     seven commits against LinApple: the socket, its tests, and the
              bugs those tests found
 clients/     the Python client (standard library only, >= 3.10)
 tools/       twelve tools that use it

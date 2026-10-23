@@ -1,7 +1,7 @@
-From 7576ca34399896a7abbb93732bd041fc326f2c54 Mon Sep 17 00:00:00 2001
+From 0d5f4b2d562caa85e40870d3b03f62ee99120038 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Fri, 18 Sep 2026 13:58:31 +0900
-Subject: [PATCH 2/9] Refuse an sdl3 recording that would be silent
+Subject: [PATCH 2/7] Refuse an sdl3 recording that would be silent
 
 The mixer's samples reach the dumper from the sound card's callback, so a
 session that never opened a device would write a WAV of nothing at all,
@@ -19,25 +19,34 @@ ok:false and the command line printed "audio: no device, not recording
 to ..." - neither left a file behind.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/frontends/sdl3/Main.cpp | 33 ++++++++++++++++++++++++++-------
- 1 file changed, 26 insertions(+), 7 deletions(-)
+ src/frontends/sdl3/Main.cpp | 30 +++++++++++++++++++++++++-----
+ 1 file changed, 25 insertions(+), 5 deletions(-)
 
 diff --git a/src/frontends/sdl3/Main.cpp b/src/frontends/sdl3/Main.cpp
-index 878d1cc..b7d0c53 100644
+index 051be03c..68d6c787 100644
 --- a/src/frontends/sdl3/Main.cpp
 +++ b/src/frontends/sdl3/Main.cpp
-@@ -29,6 +29,9 @@ bool g_ds_available = false;
- SDL_AudioStream* g_audioStream = nullptr;
- static std::string g_audio_dump_file;
- static AudioDumper_t g_audio_dumper;
+@@ -7,6 +7,7 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdio>
+ #include <string>
+ #include <vector>
+ 
+@@ -30,6 +31,9 @@ namespace {
+ SdlAudioStreamPtr audio_stream;
+ std::string audio_dump_file;
+ AudioDumper audio_dumper;
 +// The device's rate, kept because a recording started later has to be written
 +// at the rate the callback is actually fed at.
-+static uint32_t g_device_rate_hz = 0;
++uint32_t device_rate_hz = 0;
  
- static void SDLCALL sdl3_audio_callback(void* userdata, SDL_AudioStream* stream,
-                                         int additional_amount,
-@@ -56,15 +59,23 @@ static void SDLCALL sdl3_audio_callback(void* userdata, SDL_AudioStream* stream,
+ auto SDLCALL sdl3_audio_callback(void* userdata, SDL_AudioStream* stream,
+                                  int additional_amount, int total_amount)
+@@ -65,15 +69,23 @@ auto SDLCALL sdl3_audio_callback(void* userdata, SDL_AudioStream* stream,
  
  // Starting and stopping the recording while the machine runs, rather than only
  // from the command line. What is dumped here is the mixer's output - the same
@@ -56,25 +65,25 @@ index 878d1cc..b7d0c53 100644
 +  // so with no device open the file would stay silent. Refusing is the same
 +  // answer the frontends without an audio path give: a silent file cannot be
 +  // told apart from a machine that made no sound.
-+  if (g_audioStream == nullptr) {
++  if (audio_stream == nullptr) {
 +    return false;
 +  }
    frontend_audio_dump_stop();
--  if (audio_dumper_initialize(&g_audio_dumper, path, SPKR_SAMPLE_RATE, 2) !=
-+  if (audio_dumper_initialize(&g_audio_dumper, path, g_device_rate_hz, 2) !=
-       0) {
+-  if (audio_dumper_initialize(&audio_dumper, path, 44100, 2) != 0) {
++  if (audio_dumper_initialize(&audio_dumper, path, device_rate_hz, 2) != 0) {
      return false;
    }
-@@ -108,22 +119,30 @@ auto ds_init() -> bool {
+   audio_dump_file = path;
+@@ -118,13 +130,21 @@ auto ds_init() -> bool {
        SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired,
-                                 sdl3_audio_callback, nullptr);
-   if (!g_audioStream) {
+                                 sdl3_audio_callback, nullptr));
+   if (audio_stream == nullptr) {
 +    // Same reason as above: the command line asked for a recording we cannot
 +    // fill, so say so rather than leave an empty WAV behind.
-+    if (!g_audio_dump_file.empty()) {
++    if (!audio_dump_file.empty()) {
 +      fprintf(stderr, "audio: no device, not recording to %s\n",
-+              g_audio_dump_file.c_str());
-+      g_audio_dump_file.clear();
++              audio_dump_file.c_str());
++      audio_dump_file.clear();
 +    }
      return false;
    }
@@ -82,23 +91,12 @@ index 878d1cc..b7d0c53 100644
    // SDL3 honours the stream's source spec exactly, so what was asked for is
    // what the callback is fed.
 -  const auto device_rate_hz = static_cast<uint32_t>(device_rate);
-+  g_device_rate_hz = static_cast<uint32_t>(device_rate);
++  device_rate_hz = static_cast<uint32_t>(device_rate);
  
 +  // Only once the device is open, because that callback is what fills it.
-   if (!g_audio_dump_file.empty()) {
-     audio_dumper_initialize(&g_audio_dumper, g_audio_dump_file.c_str(),
--                            device_rate_hz, 2);
-+                            g_device_rate_hz, 2);
-   }
- 
-   SDL_ResumeAudioStreamDevice(g_audioStream);
-   g_ds_available = true;
- 
--  audio_mixer_initialize(device_rate_hz);
-+  audio_mixer_initialize(g_device_rate_hz);
- 
-   linapple_set_audio_source_register_callback(
-       [](int slot, const char* peripheral_id,
+   if (!audio_dump_file.empty()) {
+     audio_dumper_initialize(&audio_dumper, audio_dump_file.c_str(),
+                             device_rate_hz, 2);
 -- 
 2.53.0
 

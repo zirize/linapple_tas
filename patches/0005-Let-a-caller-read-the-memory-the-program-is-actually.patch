@@ -1,7 +1,7 @@
-From 7624e21bea26a60d903e081410b8bf5f5873cee4 Mon Sep 17 00:00:00 2001
+From 02708a161c7bc35b942164a371b88471895fca34 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 00:36:36 +0900
-Subject: [PATCH 7/9] Let a caller read the memory the program is actually
+Subject: [PATCH 5/7] Let a caller read the memory the program is actually
  reading
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -23,13 +23,14 @@ default is unchanged, the response says which image answered, and an
 unknown name is refused rather than quietly treated as main.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/frontends/common/agent/AgentCommands.cpp | 54 +++++++++++++++++---
  tests/test_agent_commands.cpp                | 33 ++++++++++++
  2 files changed, 81 insertions(+), 6 deletions(-)
 
 diff --git a/src/frontends/common/agent/AgentCommands.cpp b/src/frontends/common/agent/AgentCommands.cpp
-index 528f139..a1349e7 100644
+index c234cd73..d4f9d284 100644
 --- a/src/frontends/common/agent/AgentCommands.cpp
 +++ b/src/frontends/common/agent/AgentCommands.cpp
 @@ -143,6 +143,42 @@ auto param_string(const Json& params, const char* key) -> std::string {
@@ -75,7 +76,7 @@ index 528f139..a1349e7 100644
  // --- run control -----------------------------------------------------------
  
  // Runs exactly `frames` emulated frames and parks the machine again. Turbo and
-@@ -627,18 +663,21 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+@@ -628,18 +664,21 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
          (addr + len) > 0x10000) {
        return make_error(request, "len out of range");
      }
@@ -100,7 +101,7 @@ index 528f139..a1349e7 100644
      result["data"] = base64_encode(buffer.data(), buffer.size());
      return make_ok(request, result);
    }
-@@ -667,18 +706,21 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+@@ -668,18 +707,21 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
          (addr + static_cast<int64_t>(bytes.size())) > 0x10000) {
        return make_error(request, "write range out of bounds");
      }
@@ -126,16 +127,16 @@ index 528f139..a1349e7 100644
    }
  
 diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
-index 9076b5b..8dba521 100644
+index 8c0f5732..1f7d4d10 100644
 --- a/tests/test_agent_commands.cpp
 +++ b/tests/test_agent_commands.cpp
-@@ -482,6 +482,39 @@ TEST_CASE("Agent: mem_read returns what memory holds") {
+@@ -499,6 +499,39 @@ TEST_CASE("Agent: mem_read returns what memory holds") {
    CHECK(result.at("data").get<std::string>() == "3q2+7w==");
  }
  
 +TEST_CASE("Agent: mem_read can be asked which image to read") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +
 +  CHECK(rejects("mem_read", {{"addr", 0x6000}, {"view", "bogus"}}));
 +  CHECK(rejects("mem_write",
@@ -167,8 +168,8 @@ index 9076b5b..8dba521 100644
 +}
 +
  TEST_CASE("Agent: mem_write refuses a payload it cannot place") {
-   TestConfig_t test_config(TestConfig_t::disk_ii_only());
-   HeadlessHarness_t harness(test_config);
+   TestConfig test_config(TestConfig::disk_ii_only());
+   HeadlessHarness harness(test_config);
 -- 
 2.53.0
 

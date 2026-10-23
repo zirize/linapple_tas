@@ -1,7 +1,7 @@
-From 7eb2d5db2ad00fd49813f115234213438670b9e6 Mon Sep 17 00:00:00 2001
+From fc15c5c1c72e87ac465ab3f8b6aba44d67c4904b Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Fri, 18 Sep 2026 13:42:14 +0900
-Subject: [PATCH 1/9] Add an agent socket control channel
+Subject: [PATCH 1/7] Add an agent socket control channel
 
 A Unix socket, one JSON request per line, that lets a program drive the
 machine the way a person drives the window: keys and stick, disks, memory
@@ -14,34 +14,27 @@ same inputs give the same cycle counts and the same screen. run_frames
 advances it, run_until_change waits inside the emulator rather than
 having a client poll the screen over the socket, and screen_hash follows
 whichever page is actually being displayed so text-mode programs are not
-watched on a hi-res page that never changes.
+watched on a hi-res page that never changes. Deterministic stepping turns
+off both user turbo and disk turbo for its duration, since either one
+multiplies the cycles a frame consumes.
 
 The socket also sees what a person does at the window. The frontends log
 every keystroke and stick movement to the agent as well, stamped with the
 cycle it happened on, so a recorder can capture a live session and play
-it back. What is logged for a key is the byte the keyboard will latch,
-not the key the frontend named - shift, caps lock, layout and custom maps
-are the keyboard's business, and it is asked through a new
-keyboard_query_translate rather than guessed at.
+it back. What is logged for a key is the Apple code the host's translator
+handed the card - shift, caps lock, layout and custom maps already
+applied - and a release names the code its press did. A button is logged
+as the connector line it closes, and joy_button closes the same line.
 
 Sound can be recorded from the socket too. The dumper was wired to the
 SDL frontends only, which left headless - the one place a recording plays
-back deterministically - with nothing. The samples the core hands the
-frontend are stereo at 44100, the same shape the SDL frontends dump, and
-they arrive on emulated time, so a session replayed as fast as the host
+back deterministically - with nothing. Headless now feeds the mixer and
+pulls it on emulated time, so a session replayed as fast as the host
 allows still writes a file that plays at the right speed.
 
-Three fixes came out of testing it:
-
-  * joy_axis was sending SET_TRIM, a shared centre offset, instead of
-    SET_AXIS, so both sticks moved together and the second stick's axes
-    folded onto the first one's Y. A one-stick game hid it.
-  * Slot 0 dispatches a command to every peripheral in it, and the
-    keyboard's event id and the joystick's set-button id are both 1. The
-    joystick only checked that the payload was big enough, so a key event
-    was read as a button payload and Ctrl-A released a held button.
-  * The frontend's joystick path passed Linux's -32767..32767 straight
-    through, so every stick movement went to the rail.
+linapple_set_joystick_axis is back as the socket's way to place a stick:
+axes 0-3 numbered as the paddle registers are, a position clamped to
+0..255, sent as JOYSTICK_CMD_SET_AXIS.
 
 An idle session used to hold a core at full clock. The agent loop blocks
 in poll() when the machine is paused and paces itself to the Apple II's
@@ -49,32 +42,32 @@ frame rate when it is running, which takes it from 500 wake-ups a second
 to 5.
 
 Built with -DENABLE_AGENT (default on) and covered by
-tests/test_agent_commands.cpp - 34 cases, no game disk needed.
+tests/test_agent_commands.cpp - no game disk needed. The game port keeps
+no positions in its state frame any more, so the tests read a stick the
+way a program does, with a PREAD loop.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  CMakeLists.txt                                |   26 +-
- src/apple2/peripherals/joystick/Joystick.cpp  |   10 +-
- src/apple2/peripherals/keyboard/Keyboard.cpp  |   68 +-
- .../peripherals/keyboard/KeyboardCommands.h   |   20 +-
- src/core/LinAppleCore.cpp                     |   18 +-
- src/frontends/common/AppArgs.cpp              |   11 +-
- src/frontends/common/AppConfig.h              |    1 +
- src/frontends/common/AudioDumper.cpp          |   16 +
- src/frontends/common/Frontend.h               |    9 +
- src/frontends/common/agent/AgentCommands.cpp  |  932 +++++++++++++++
+ src/core/LinAppleCore.cpp                     |   15 +
+ src/core/LinAppleCore.h                       |    3 +
+ src/core/Registry.h                           |    1 +
+ src/frontends/common/AppArgs.cpp              |    8 +
+ src/frontends/common/AudioDumper.cpp          |   14 +
+ src/frontends/common/Frontend.h               |    8 +
+ src/frontends/common/agent/AgentCommands.cpp  |  933 +++++++++++++++
  src/frontends/common/agent/AgentCommands.h    |    9 +
- src/frontends/common/agent/AgentInput.cpp     |  120 ++
- src/frontends/common/agent/AgentInput.h       |   61 +
+ src/frontends/common/agent/AgentInput.cpp     |   88 ++
+ src/frontends/common/agent/AgentInput.h       |   59 +
  src/frontends/common/agent/AgentServer.cpp    |  297 +++++
  src/frontends/common/agent/AgentServer.h      |   23 +
- src/frontends/common/sdl/JoystickFrontend.cpp |  107 +-
+ src/frontends/common/sdl/JoystickFrontend.cpp |    6 +
  src/frontends/common/sdl/Keyboard.cpp         |    4 +
- src/frontends/headless/Main.cpp               |  196 +++-
- src/frontends/sdl3/Main.cpp                   |   56 +-
- src/frontends/tui/TuiInput.cpp                |    8 +-
- tests/test_agent_commands.cpp                 | 1032 +++++++++++++++++
- 21 files changed, 2944 insertions(+), 80 deletions(-)
+ src/frontends/headless/Main.cpp               |  194 +++-
+ src/frontends/sdl3/Main.cpp                   |   55 +-
+ tests/test_agent_commands.cpp                 | 1020 +++++++++++++++++
+ 18 files changed, 2751 insertions(+), 12 deletions(-)
  create mode 100644 src/frontends/common/agent/AgentCommands.cpp
  create mode 100644 src/frontends/common/agent/AgentCommands.h
  create mode 100644 src/frontends/common/agent/AgentInput.cpp
@@ -84,19 +77,19 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  create mode 100644 tests/test_agent_commands.cpp
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 38f0385..36a9214 100644
+index d8154a49..710355ab 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -32,6 +32,7 @@ else()
-     set(FRONTEND_HAS_FTP ON)
+@@ -37,6 +37,7 @@ else()
  endif()
  option(ENABLE_DEBUGGER "Enable integrated debugger" ${DEFAULT_ENABLE_DEBUGGER})
+ option(ENABLE_FTP "Enable FTP support" ON)
 +option(ENABLE_AGENT "Enable the Unix socket tool-assistant control channel" ON)
  
  option(PROFILING "Enable profiling" OFF)
  option(REGISTRY_WRITEABLE "Enable registry writing" ON)
-@@ -364,6 +365,18 @@ set(SOURCES_CORE
-     src/frontends/common/PrinterFrontend.cpp
+@@ -383,6 +384,18 @@ set(SOURCES_CORE
+     src/core/services/ftp/FtpParser.cpp
  )
  
 +if(ENABLE_AGENT)
@@ -112,24 +105,24 @@ index 38f0385..36a9214 100644
 +endif()
 +
  set(SOURCES_A2_MANDATORY
-     src/apple2/chips/6821.cpp
      src/apple2/CPU.cpp
-@@ -532,7 +545,10 @@ function(add_linapple_executable TARGET_NAME FE_NAME FE_SOURCES DBG_SOURCES EXTR
+     src/apple2/Memory.cpp
+@@ -688,7 +701,10 @@ function(add_linapple_executable TARGET_NAME FE_NAME FE_SOURCES DBG_SOURCES EXTR
      endif()
      set_target_properties(${TARGET_NAME} PROPERTIES ENABLE_EXPORTS TRUE)
      target_include_directories(${TARGET_NAME} PRIVATE ${LINAPPLE_INCLUDES} ${EXTRA_INCLUDES})
--    target_link_libraries(${TARGET_NAME} PRIVATE ${COMMON_LIBS} ${EXTRA_LIBS})
-+    target_link_libraries(${TARGET_NAME} PRIVATE ${COMMON_LIBS} ${EXTRA_LIBS} ${AGENT_LIBS})
+-    target_link_libraries(${TARGET_NAME} PRIVATE ${COMMON_LIBS} ${EXTRA_LIBS} ${MEDIA_TARGETS})
++    target_link_libraries(${TARGET_NAME} PRIVATE ${COMMON_LIBS} ${EXTRA_LIBS} ${MEDIA_TARGETS} ${AGENT_LIBS})
 +    if(ENABLE_AGENT)
 +        target_compile_definitions(${TARGET_NAME} PRIVATE LINAPPLE_AGENT=1)
 +    endif()
      if(FE_NAME STREQUAL "sdl1")
-         list(APPEND EXTRA_DEFS LINAPPLE_SDL_VERSION=1)
+         target_include_directories(${TARGET_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/frontends/sdl1")
      elseif(FE_NAME STREQUAL "sdl2")
-@@ -620,6 +636,10 @@ if(BUILD_TESTING)
+@@ -776,6 +792,10 @@ if(BUILD_TESTING)
      # Helper for adding tests
      macro(add_linapple_test name sources)
-         add_executable(test-${name} ${sources} tests/test_fixtures_core.cpp ${SOURCES_CORE} ${SOURCES_A2_MANDATORY} ${SOURCES_DBG} ${SOURCES_A2_OPTIONAL} src/frontends/headless/Stubs.cpp src/frontends/headless/Headless_Path.cpp)
+         add_executable(test-${name} ${sources} tests/test_fixtures_core.cpp ${SOURCES_CORE} ${SOURCES_A2_MANDATORY} ${SOURCES_DBG} ${SOURCES_A2_OPTIONAL} src/frontends/headless/Stubs.cpp)
 +        if(ENABLE_AGENT)
 +            target_link_libraries(test-${name} PRIVATE ${AGENT_LIBS})
 +            target_compile_definitions(test-${name} PRIVATE LINAPPLE_AGENT=1)
@@ -137,9 +130,9 @@ index 38f0385..36a9214 100644
          add_dependencies(test-${name} generate_xpms generate_embedded_roms)
          if(PERIPHERAL_MODULES)
              add_dependencies(test-${name} ${PERIPHERAL_MODULES})
-@@ -709,6 +729,10 @@ if(BUILD_TESTING)
-     add_linapple_test(disk-config-runtime-eject tests/test_disk_config_runtime_eject.cpp)
-     add_linapple_test(headless-boot "tests/HeadlessHarness.cpp;tests/test_headless_boot.cpp")
+@@ -1102,6 +1122,10 @@ done
+     add_linapple_test(basic-live-sync "tests/test_main.cpp;tests/test_basic_live_sync.cpp")
+     add_linapple_test(asset "tests/test_main.cpp;tests/test_asset.cpp")
  
 +    if(ENABLE_AGENT)
 +        add_linapple_test(agent-commands "tests/HeadlessHarness.cpp;tests/test_agent_commands.cpp")
@@ -148,276 +141,121 @@ index 38f0385..36a9214 100644
      add_linapple_test(file-browser tests/test_file_browser.cpp)
  
      add_executable(test-util-hash tests/test_util_hash.cpp src/frontends/common/Util_Hash.cpp)
-diff --git a/src/apple2/peripherals/joystick/Joystick.cpp b/src/apple2/peripherals/joystick/Joystick.cpp
-index a183598..85840ca 100644
---- a/src/apple2/peripherals/joystick/Joystick.cpp
-+++ b/src/apple2/peripherals/joystick/Joystick.cpp
-@@ -228,7 +228,11 @@ static auto joystick_abi_command(void* instance, uint32_t cmd, const void* data,
- 
-   switch (cmd) {
-     case JOY_CMD_SET_AXIS: {
--      if (data == nullptr || size < sizeof(JoystickAxisPayload_t)) {
-+      // Exactly this payload, not merely enough of one. Slot 0 is shared and
-+      // the command ids overlap - a keyboard event is also id 1 - so a command
-+      // meant for another peripheral arrives here too, and a length test that
-+      // accepts anything larger reads it as a joystick payload.
-+      if (data == nullptr || size != sizeof(JoystickAxisPayload_t)) {
-         return peripheral_error;
-       }
-       const auto* payload = static_cast<const JoystickAxisPayload_t*>(data);
-@@ -243,7 +247,7 @@ static auto joystick_abi_command(void* instance, uint32_t cmd, const void* data,
-       return peripheral_ok;
-     }
-     case JOY_CMD_SET_BUTTON: {
--      if (data == nullptr || size < sizeof(JoystickButtonPayload_t)) {
-+      if (data == nullptr || size != sizeof(JoystickButtonPayload_t)) {
-         return peripheral_error;
-       }
-       const auto* payload = static_cast<const JoystickButtonPayload_t*>(data);
-@@ -258,7 +262,7 @@ static auto joystick_abi_command(void* instance, uint32_t cmd, const void* data,
-       return peripheral_ok;
-     }
-     case JOY_CMD_SET_TRIM: {
--      if (data == nullptr || size < sizeof(JoystickTrimPayload_t)) {
-+      if (data == nullptr || size != sizeof(JoystickTrimPayload_t)) {
-         return peripheral_error;
-       }
-       const auto* payload = static_cast<const JoystickTrimPayload_t*>(data);
-diff --git a/src/apple2/peripherals/keyboard/Keyboard.cpp b/src/apple2/peripherals/keyboard/Keyboard.cpp
-index 509ebeb..5b90905 100644
---- a/src/apple2/peripherals/keyboard/Keyboard.cpp
-+++ b/src/apple2/peripherals/keyboard/Keyboard.cpp
-@@ -432,6 +432,44 @@ auto keyboard_apply_symbolic_shift(uint32_t key, bool shift, bool ctrl,
-   return key;
- }
- 
-+// What a key event turns into for the machine, without pressing anything.
-+//
-+// The command handler below uses this to decide what to latch, and the
-+// keyboard_query_translate query hands the same answer to a caller that only
-+// wants to know - a recorder logging what a person typed, for instance, which
-+// has to write down the byte a replay would send rather than the key the
-+// frontend happened to name. False means the key reaches the machine as
-+// nothing at all: an Apple key, or one this layout has no byte for.
-+auto keyboard_translate_key(KeyboardPeripheral_t* kp, const KeyboardEvent_t* ev,
-+                            uint32_t* out) -> bool {
-+  namespace kp_const = kb;
-+
-+  if (kp->logic.has_custom_keys && ev->key >= kp_const::positional_threshold) {
-+    const int idx = static_cast<int>(ev->key - kp_const::positional_threshold);
-+    if (idx >= 0 && idx < KEYBOARD_MAP_SIZE &&
-+        (kp->logic.custom_flags[idx] & 6) != 0) {
-+      return false;  // mapped to an Apple key: no character is latched
-+    }
-+  }
-+
-+  uint32_t key = ev->key;
-+  if (key >= kp_const::positional_threshold) {
-+    key = keyboard_map_positional(kp, key, ev->mod_shift != 0U,
-+                                  ev->mod_ctrl != 0U);
-+  } else if (key >= 0x100) {
-+    key = keyboard_map_symbolic(key);
-+  } else if (key != 0) {
-+    key = keyboard_apply_symbolic_shift(
-+        key, ev->mod_shift != 0U, ev->mod_ctrl != 0U, kp->logic.caps_lock);
-+  }
-+
-+  if (key > kp_const::key_code_mask) {
-+    return false;
-+  }
-+  *out = key;
-+  return true;
-+}
-+
- auto keyboard_abi_command(void* instance, uint32_t cmd_id, const void* data,
-                           size_t size) -> PeripheralStatus_t {
-   if (instance == nullptr || (size > 0 && data == nullptr)) {
-@@ -488,18 +526,8 @@ auto keyboard_abi_command(void* instance, uint32_t cmd_id, const void* data,
-         }
-       }
- 
--      uint32_t key = ev->key;
--      if (key >= kp_const::positional_threshold) {
--        key = keyboard_map_positional(kp, key, ev->mod_shift != 0U,
--                                      ev->mod_ctrl != 0U);
--      } else if (key >= 0x100) {
--        key = keyboard_map_symbolic(key);
--      } else if (key != 0) {
--        key = keyboard_apply_symbolic_shift(
--            key, ev->mod_shift != 0U, ev->mod_ctrl != 0U, kp->logic.caps_lock);
--      }
--
--      if (key > kp_const::key_code_mask) {
-+      uint32_t key = 0;
-+      if (!keyboard_translate_key(kp, ev, &key)) {
-         return peripheral_ok;
-       }
- 
-@@ -702,6 +730,22 @@ auto keyboard_abi_query(void* instance, uint32_t cmd_id, void* out,
-       *out_size = sizeof(KeyboardModifiers_t);
-       return peripheral_ok;
-     }
-+    case keyboard_query_translate: {
-+      if (out == nullptr) {
-+        *out_size = sizeof(KeyboardTranslate_t);
-+        return peripheral_ok;
-+      }
-+      if (*out_size < sizeof(KeyboardTranslate_t)) {
-+        return peripheral_error;
-+      }
-+      auto* request = static_cast<KeyboardTranslate_t*>(out);
-+      uint32_t key = 0;
-+      request->latched =
-+          keyboard_translate_key(kp, &request->event, &key) ? 1U : 0U;
-+      request->key = key;
-+      *out_size = sizeof(KeyboardTranslate_t);
-+      return peripheral_ok;
-+    }
-     case keyboard_query_rocker: {
-       if (out == nullptr) {
-         *out_size = sizeof(uint8_t);
-diff --git a/src/apple2/peripherals/keyboard/KeyboardCommands.h b/src/apple2/peripherals/keyboard/KeyboardCommands.h
-index 17ca5bd..b18b010 100644
---- a/src/apple2/peripherals/keyboard/KeyboardCommands.h
-+++ b/src/apple2/peripherals/keyboard/KeyboardCommands.h
-@@ -42,8 +42,9 @@ typedef enum {
- } KeyboardCmd_t;
- 
- typedef enum {
--  keyboard_query_mods = 0x0001,  /**< out: KeyboardModifiers_t */
--  keyboard_query_rocker = 0x0002 /**< out: uint8_t (0=off, 1=on) */
-+  keyboard_query_mods = 0x0001,     /**< out: KeyboardModifiers_t */
-+  keyboard_query_rocker = 0x0002,   /**< out: uint8_t (0=off, 1=on) */
-+  keyboard_query_translate = 0x0003 /**< in/out: KeyboardTranslate_t */
- } KeyboardQuery_t;
- 
- typedef struct {
-@@ -65,6 +66,21 @@ typedef struct {
-   uint8_t reserved[3]; /**< Padding for 12-byte ABI alignment */
- } KeyboardEvent_t;
- 
-+/** What a key event would turn into, without pressing anything.
-+ *
-+ * The caller fills in `event` exactly as it would send it and reads back the
-+ * byte the machine would latch. Only the keyboard can answer this: the layout,
-+ * the custom maps and the caps-lock state all live here, which is why a
-+ * frontend that wants to log what a person typed has to ask rather than work
-+ * it out for itself.
-+ */
-+typedef struct {
-+  KeyboardEvent_t event; /**< in: the event as it would be sent */
-+  uint32_t key;          /**< out: the byte the keyboard would latch */
-+  uint8_t latched; /**< out: 0 when the key reaches the machine as nothing */
-+  uint8_t reserved[3]; /**< Padding for 8-byte ABI alignment */
-+} KeyboardTranslate_t;
-+
- typedef struct {
-   uint32_t scancode;
-   uint8_t normal_val;
 diff --git a/src/core/LinAppleCore.cpp b/src/core/LinAppleCore.cpp
-index 410e1ac..a1cb4c0 100644
+index 10696717..4ed76165 100644
 --- a/src/core/LinAppleCore.cpp
 +++ b/src/core/LinAppleCore.cpp
-@@ -456,9 +456,23 @@ auto linapple_set_apple_key(int key, bool down) -> void {
-   peripheral_command(0, keyboard_cmd_set_mods, &mods, sizeof(mods));
+@@ -22,6 +22,7 @@
+ #include "apple2/peripherals/Peripheral_Types.h"
+ #include "apple2/peripherals/disk/DiskCommands.h"
+ #include "apple2/peripherals/harddisk/HarddiskCommands.h"
++#include "apple2/peripherals/joystick/JoystickCommands.h"
+ #include "apple2/peripherals/keyboard/KeyboardCommands.h"
+ #include "core/Asset.h"
+ #include "core/BasicLiveSync.h"
+@@ -618,6 +619,20 @@ auto linapple_set_modifiers(bool shift, bool ctrl, bool open_apple,
+   switch_inputs_set_level(2, switch_source_keyboard, shift);
  }
  
-+// Both callers mean "the stick is here now", which is JOY_CMD_SET_AXIS. This
-+// used to drive JOY_CMD_SET_TRIM instead — the calibration offset a user nudges
-+// once and leaves alone. Trim is shared by both sticks and has only an x and a
-+// y, so the second joystick's axes folded onto the first one's, and a caller's
-+// value landed as an offset from the resting 127 rather than a position.
-+//
-+// Axes are numbered the way the paddle registers are: 0 and 1 are the first
-+// stick's x and y, 2 and 3 the second stick's.
- auto linapple_set_joystick_axis(int axis, int value) -> void {
--  JoystickTrimPayload_t payload = {axis == 0, 0, static_cast<int16_t>(value)};
--  peripheral_command(0, JOY_CMD_SET_TRIM, &payload, sizeof(payload));
++// The agent socket's way to put a stick somewhere. Axes are numbered the way
++// the paddle registers are: 0 and 1 are the first stick's x and y, 2 and 3
++// the second stick's. The value is a position, clamped to the port's range.
++auto linapple_set_joystick_axis(int axis, int value) -> void {
 +  if (axis < 0 || axis > 3) {
 +    return;
 +  }
 +  const int position = (value < 0) ? 0 : ((value > 255) ? 255 : value);
-+  JoystickAxisPayload_t payload = {static_cast<uint8_t>(axis >> 1),
-+                                   static_cast<uint8_t>(axis & 1),
-+                                   static_cast<uint8_t>(position)};
-+  peripheral_command(0, JOY_CMD_SET_AXIS, &payload, sizeof(payload));
++  const JoystickAxisPayload payload = {static_cast<uint8_t>(axis >> 1),
++                                       static_cast<uint8_t>(axis & 1),
++                                       static_cast<uint8_t>(position), 0};
++  peripheral_command(0, JOYSTICK_CMD_SET_AXIS, &payload, sizeof(payload));
++}
++
+ auto linapple_set_game_switch(uint8_t line, bool down) -> void {
+   switch_inputs_set_level(line, switch_source_connector, down);
  }
+diff --git a/src/core/LinAppleCore.h b/src/core/LinAppleCore.h
+index baa3b0ab..da09470e 100644
+--- a/src/core/LinAppleCore.h
++++ b/src/core/LinAppleCore.h
+@@ -246,6 +246,9 @@ auto linapple_get_rocker_switch() -> bool;
+ auto linapple_set_game_switch(uint8_t line, bool down) -> void;
+ auto linapple_set_game_pulldowns(uint8_t mask) -> void;
+ auto linapple_set_shift_key_mod(bool jumper_in) -> void;
++// A paddle position for the agent socket: axis 0-3 as the paddle registers
++// number them, value 0-255.
++auto linapple_set_joystick_axis(int axis, int value) -> void;
  
- auto linapple_set_joystick_button(int button, bool down) -> void {
+ auto linapple_set_video_callback(LinappleVideoCallback cb) -> void;
+ auto linapple_set_audio_channel_callback(FrontendAudioChannelCallback cb)
+diff --git a/src/core/Registry.h b/src/core/Registry.h
+index 55dbe379..7f401380 100644
+--- a/src/core/Registry.h
++++ b/src/core/Registry.h
+@@ -103,6 +103,7 @@ struct Configuration {
+   std::array<char, path_max_len> snapshot_path = {};
+   std::array<char, path_max_len> audio_dump_path = {};
+   std::array<char, path_max_len> rom_path = {};
++  std::array<char, path_max_len> agent_socket_path = {};
+ 
+   Apple2Type apple2_type = A2TYPE_APPLE2EENHANCED;
+   bool apple2_type_explicit = false;
 diff --git a/src/frontends/common/AppArgs.cpp b/src/frontends/common/AppArgs.cpp
-index e4fe0d2..19c42cc 100644
+index a4c4ac79..061f1b6b 100644
 --- a/src/frontends/common/AppArgs.cpp
 +++ b/src/frontends/common/AppArgs.cpp
-@@ -26,8 +26,9 @@ static constexpr int opt_basic_sync = 0x105;
- static constexpr int opt_basic_line_mode = 0x106;
- static constexpr int opt_caps_mode = 0x107;
- static constexpr int opt_tui_render = 0x108;
-+static constexpr int opt_agent_socket = 0x109;
+@@ -51,6 +51,7 @@ enum OptId : uint8_t {
+   opt_basic_line_mode,
+   opt_caps_mode,
+   opt_tui_render,
++  opt_agent_socket,
+ };
  
--static const std::array<struct option, 30> OptionTable = {
-+static const std::array<struct option, 31> OptionTable = {
-     {{"d1", required_argument, nullptr, '1'},
-      {"d2", required_argument, nullptr, '2'},
-      {"hd1", required_argument, nullptr, opt_hd1},
-@@ -57,6 +58,7 @@ static const std::array<struct option, 30> OptionTable = {
-      {"basic-line-mode", required_argument, nullptr, opt_basic_line_mode},
-      {"caps-mode", required_argument, nullptr, opt_caps_mode},
-      {"tui-render", required_argument, nullptr, opt_tui_render},
-+     {"agent-socket", required_argument, nullptr, opt_agent_socket},
-      {nullptr, 0, nullptr, 0}}};
+ struct OptionDef {
+@@ -90,6 +91,7 @@ constexpr OptionDef options[] = {
+     {"basic-line-mode", '\0', ArgType::req_arg, opt_basic_line_mode},
+     {"caps-mode", '\0', ArgType::req_arg, opt_caps_mode},
+     {"tui-render", '\0', ArgType::req_arg, opt_tui_render},
++    {"agent-socket", '\0', ArgType::req_arg, opt_agent_socket},
+ };
  
- static const char* OptString = "1:2:abc:fhlmpP:R:s:vx:T:X:6CA:";
-@@ -111,6 +113,9 @@ void app_args_print_help() {
+ auto parse_tui_render_mode(const char* arg, TuiRenderMode* out_mode) -> bool {
+@@ -255,6 +257,9 @@ auto apply_option(OptId id, const char* val, AppConfig* config) -> int {
+       }
+       config->tui_render_mode_explicit = true;
+       break;
++    case opt_agent_socket:
++      util_safe_strcpy(config->agent_socket_path.data(), val, path_max_len);
++      break;
+     case opt_unknown:
+     default:
+       break;
+@@ -317,6 +322,9 @@ auto app_args_print_help() -> void {
+   printf(
        "  --tui-render <mode>    Set TUI graphics render mode: smart (default) "
-       "or "
-       "block\n");
+       "or block\n");
 +  printf(
 +      "  --agent-socket <path>  Listen for tool-assistant commands on a Unix "
 +      "socket\n");
  
    printf("\nBuilt-in System ROMs:\n");
  #if ENABLE_ROM_APPLE2
-@@ -275,6 +280,10 @@ auto app_args_parse(int argc, char** argv, AppConfig_t* outConfig) -> int {
-           outConfig->caps_lock_mode = CAPS_MODE_HOST;
-         }
-         break;
-+      case opt_agent_socket:
-+        util_safe_strcpy(outConfig->agent_socket_path.data(), optarg,
-+                         path_max_len);
-+        break;
-       case opt_tui_render:
-         if (optarg != nullptr) {
-           if (std::strcmp(optarg, "block") == 0 ||
-diff --git a/src/frontends/common/AppConfig.h b/src/frontends/common/AppConfig.h
-index 940655e..857c292 100644
---- a/src/frontends/common/AppConfig.h
-+++ b/src/frontends/common/AppConfig.h
-@@ -27,6 +27,7 @@ struct AppConfig_t {
-   std::array<char, path_max_len> snapshot_path = {};
-   std::array<char, path_max_len> audio_dump_path = {};
-   std::array<char, path_max_len> rom_path = {};
-+  std::array<char, path_max_len> agent_socket_path = {};
- 
-   eApple2Type apple2_type = A2TYPE_APPLE2EENHANCED;
-   bool apple2_type_explicit = false;
 diff --git a/src/frontends/common/AudioDumper.cpp b/src/frontends/common/AudioDumper.cpp
-index 1e66aaf..cbeef3b 100644
+index c39df3fa..98b1c43d 100644
 --- a/src/frontends/common/AudioDumper.cpp
 +++ b/src/frontends/common/AudioDumper.cpp
-@@ -8,6 +8,8 @@
- #include <mutex>
+@@ -8,6 +8,7 @@
  #include <utility>
  
+ #include "core/Util_Endian.h"
 +#include "frontends/common/Frontend.h"
-+
+ 
  namespace {
  
- constexpr uint32_t fmt_chunk_size = 16;
-@@ -230,3 +232,17 @@ auto audio_dumper_finalize(AudioDumper_t* dumper) -> int {
-   dumper->finalize();
-   return 0;
+@@ -201,3 +202,16 @@ auto audio_dumper_is_active(const AudioDumper* dumper) -> bool {
+   }
+   return dumper->is_active();
  }
-+
 +// Frontends that have no audio path of their own keep these. Saying no here is
 +// better than writing an empty WAV: a caller that asked to record and got
 +// silence has no way to tell that from a machine that made no sound.
@@ -432,12 +270,12 @@ index 1e66aaf..cbeef3b 100644
 +
 +WEAK auto frontend_audio_dump_path() -> const char* { return ""; }
 diff --git a/src/frontends/common/Frontend.h b/src/frontends/common/Frontend.h
-index 164d17a..90ba14b 100644
+index e72813d8..adc851d8 100644
 --- a/src/frontends/common/Frontend.h
 +++ b/src/frontends/common/Frontend.h
-@@ -28,6 +28,15 @@ auto frontend_dispatch_key_event(uint32_t scancode, uint32_t keycode,
-                                  uint32_t mod, bool is_down) -> void;
- auto frontend_to_core_key(int key, uint32_t mod) -> LinAppleKey;
+@@ -31,5 +31,13 @@ auto keyboard_press_caps_lock(uint32_t mod) -> void;
+ // On focus loss the releases of whatever was held never arrive.
+ auto keyboard_release_host_modifiers() -> void;
  
 +// Recording the machine's sound to a WAV file, started and stopped while it
 +// runs rather than only from the command line. A frontend that has somewhere
@@ -447,16 +285,14 @@ index 164d17a..90ba14b 100644
 +auto frontend_audio_dump_stop() -> void;
 +// The file being written, or an empty string when nothing is being recorded.
 +auto frontend_audio_dump_path() -> const char*;
-+
- // Constants
  constexpr int window_width = SCREEN_WIDTH;
  constexpr int window_height = SCREEN_HEIGHT;
 diff --git a/src/frontends/common/agent/AgentCommands.cpp b/src/frontends/common/agent/AgentCommands.cpp
 new file mode 100644
-index 0000000..528f139
+index 00000000..c234cd73
 --- /dev/null
 +++ b/src/frontends/common/agent/AgentCommands.cpp
-@@ -0,0 +1,932 @@
+@@ -0,0 +1,933 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "frontends/common/agent/AgentCommands.h"
 +
@@ -609,44 +445,44 @@ index 0000000..528f139
 +// linapple_run_frame() call consumes, so deterministic stepping disables them
 +// for the duration and restores the caller's settings afterwards.
 +auto step_frames(uint32_t frames, bool deterministic) -> uint64_t {
-+  const AppMode_t saved_mode = g_state.mode;
++  const AppMode saved_mode = system_state.mode;
 +  const bool saved_turbo = linapple_get_turbo();
-+  const uint32_t saved_precision = g_state.needsprecision;
++  bool saved_disk_turbo = false;
 +
 +  if (deterministic) {
 +    linapple_set_turbo(false);
-+    g_state.needsprecision = 1;
++    saved_disk_turbo = linapple_set_disk_turbo(false);
 +  }
-+  g_state.mode = MODE_RUNNING;
++  system_state.mode = app_mode_running;
 +
 +  uint64_t executed = 0;
 +  for (uint32_t i = 0; i < frames; ++i) {
 +    executed += linapple_run_frame(apple2_frame_cycles);
 +  }
 +
-+  g_state.mode = (saved_mode == MODE_EXIT) ? MODE_EXIT : MODE_PAUSED;
++  system_state.mode = (saved_mode == app_mode_exit) ? app_mode_exit : app_mode_paused;
 +  if (deterministic) {
 +    linapple_set_turbo(saved_turbo);
-+    g_state.needsprecision = saved_precision;
++    linapple_set_disk_turbo(saved_disk_turbo);
 +  }
 +  return executed;
 +}
 +
-+auto mode_name(AppMode_t mode) -> const char* {
++auto mode_name(AppMode mode) -> const char* {
 +  switch (mode) {
-+    case MODE_LOGO:
++    case app_mode_logo:
 +      return "logo";
-+    case MODE_PAUSED:
++    case app_mode_paused:
 +      return "paused";
-+    case MODE_RUNNING:
++    case app_mode_running:
 +      return "running";
-+    case MODE_DEBUG:
++    case app_mode_debug:
 +      return "debug";
-+    case MODE_STEPPING:
++    case app_mode_stepping:
 +      return "stepping";
-+    case MODE_DISK_CHOOSE:
++    case app_mode_disk_choose:
 +      return "disk_choose";
-+    case MODE_EXIT:
++    case app_mode_exit:
 +      return "exit";
 +  }
 +  return "unknown";
@@ -793,14 +629,14 @@ index 0000000..528f139
 +
 +// --- disk ------------------------------------------------------------------
 +
-+auto query_disk_status(DiskStatus_t* status) -> bool {
-+  size_t size = sizeof(DiskStatus_t);
++auto query_disk_status(DiskStatus* status) -> bool {
++  size_t size = sizeof(DiskStatus);
 +  return peripheral_query(disk_default_slot, disk_query_status, status,
 +                          &size) == peripheral_ok;
 +}
 +
 +auto disk_status_json() -> Json {
-+  DiskStatus_t status = {};
++  DiskStatus status = {};
 +  Json result;
 +  if (!query_disk_status(&status)) {
 +    result["drives"] = Json::array();
@@ -877,7 +713,7 @@ index 0000000..528f139
 +
 +  if (cmd == "status") {
 +    Json result;
-+    result["mode"] = mode_name(g_state.mode);
++    result["mode"] = mode_name(system_state.mode);
 +    result["speed"] = linapple_get_speed();
 +    result["turbo"] = linapple_get_turbo();
 +    result["cycles"] = cpu_get_cumulative_cycles();
@@ -962,8 +798,10 @@ index 0000000..528f139
 +    if (button < 0 || button > 2) {
 +      return make_error(request, "button must be in 0..2");
 +    }
-+    linapple_set_joystick_button(static_cast<int>(button),
-+                                 param_bool(params, "down", false));
++    // A button is a switch on the game connector's line, the same one a
++    // frontend's controller closes.
++    linapple_set_game_switch(static_cast<uint8_t>(button),
++                             param_bool(params, "down", false));
 +    return make_ok(request, Json::object());
 +  }
 +
@@ -978,17 +816,17 @@ index 0000000..528f139
 +    Json result;
 +    result["frames"] = frames;
 +    result["cycles"] = executed;
-+    result["mode"] = mode_name(g_state.mode);
++    result["mode"] = mode_name(system_state.mode);
 +    return make_ok(request, result);
 +  }
 +
 +  if (cmd == "pause") {
-+    g_state.mode = MODE_PAUSED;
++    system_state.mode = app_mode_paused;
 +    return make_ok(request, Json::object());
 +  }
 +
 +  if (cmd == "resume") {
-+    g_state.mode = MODE_RUNNING;
++    system_state.mode = app_mode_running;
 +    return make_ok(request, Json::object());
 +  }
 +
@@ -1002,8 +840,8 @@ index 0000000..528f139
 +  }
 +
 +  if (cmd == "speed_set") {
-+    const int64_t speed = param_int(params, "speed", SPEED_NORMAL);
-+    if (speed < SPEED_MIN || speed > emulation_speed_max) {
++    const int64_t speed = param_int(params, "speed", emulation_speed_normal);
++    if (speed < emulation_speed_min || speed > emulation_speed_max) {
 +      return make_error(request, "speed out of range");
 +    }
 +    linapple_set_speed(static_cast<uint32_t>(speed));
@@ -1020,7 +858,7 @@ index 0000000..528f139
 +  }
 +
 +  if (cmd == "quit") {
-+    g_state.mode = MODE_EXIT;
++    system_state.mode = app_mode_exit;
 +    return make_ok(request, Json::object());
 +  }
 +
@@ -1036,13 +874,12 @@ index 0000000..528f139
 +    if (path.size() >= disk_insert_path_max) {
 +      return make_error(request, "path too long");
 +    }
-+    DiskInsertCmd_t insert = {};
++    DiskInsertCmd insert = {};
 +    std::memcpy(static_cast<void*>(insert.path), path.c_str(), path.size() + 1);
 +    insert.drive = static_cast<uint8_t>(drive);
 +    insert.write_protected =
 +        param_bool(params, "write_protected", false) ? 1 : 0;
-+    insert.create_if_necessary = 0;
-+    const PeripheralStatus_t status = peripheral_command(
++    const PeripheralStatus status = peripheral_command(
 +        disk_default_slot, disk_cmd_insert, &insert, sizeof(insert));
 +    if (status != peripheral_ok) {
 +      return make_error(request, "disk_insert failed");
@@ -1055,7 +892,7 @@ index 0000000..528f139
 +    if (drive != 0 && drive != 1) {
 +      return make_error(request, "drive must be 0 or 1");
 +    }
-+    DiskEjectCmd_t eject = {};
++    DiskEjectCmd eject = {};
 +    eject.drive = static_cast<uint8_t>(drive);
 +    if (peripheral_command(disk_default_slot, disk_cmd_eject, &eject,
 +                           sizeof(eject)) != peripheral_ok) {
@@ -1142,7 +979,7 @@ index 0000000..528f139
 +  }
 +
 +  if (cmd == "cpu_regs") {
-+    const CpuRegisters_t* regs = cpu_get_registers();
++    const CpuRegisters* regs = cpu_get_registers();
 +    if (regs == nullptr) {
 +      return make_error(request, "cpu registers unavailable");
 +    }
@@ -1235,7 +1072,7 @@ index 0000000..528f139
 +    result["cycles"] = executed;
 +    result["changed"] = changed;
 +    result["hash"] = previous;
-+    result["mode"] = mode_name(g_state.mode);
++    result["mode"] = mode_name(system_state.mode);
 +    return make_ok(request, result);
 +  }
 +
@@ -1391,7 +1228,7 @@ index 0000000..528f139
 +}
 diff --git a/src/frontends/common/agent/AgentCommands.h b/src/frontends/common/agent/AgentCommands.h
 new file mode 100644
-index 0000000..b66bd0e
+index 00000000..b66bd0e4
 --- /dev/null
 +++ b/src/frontends/common/agent/AgentCommands.h
 @@ -0,0 +1,9 @@
@@ -1406,10 +1243,10 @@ index 0000000..b66bd0e
 +auto agent_command_dispatch(const std::string& request_line) -> std::string;
 diff --git a/src/frontends/common/agent/AgentInput.cpp b/src/frontends/common/agent/AgentInput.cpp
 new file mode 100644
-index 0000000..b303b29
+index 00000000..2db908d4
 --- /dev/null
 +++ b/src/frontends/common/agent/AgentInput.cpp
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,88 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include "frontends/common/agent/AgentInput.h"
 +
@@ -1447,26 +1284,6 @@ index 0000000..b303b29
 +      AgentInputEvent_t{cpu_get_cumulative_cycles(), kind, code, value});
 +}
 +
-+constexpr int keyboard_slot = 0;
-+
-+// Asks the keyboard what this event puts on the machine's doorstep. That is
-+// the only byte worth logging: it is what a client would have to send to press
-+// the same key, shift, caps lock, layout and custom maps included. -1 means
-+// nothing arrives, so there is nothing a replay could repeat.
-+auto latched_key(const KeyboardEvent_t* event) -> int {
-+  KeyboardTranslate_t request{};
-+  request.event = *event;
-+  size_t size = sizeof(request);
-+  if (peripheral_query(keyboard_slot, keyboard_query_translate, &request,
-+                       &size) != peripheral_ok) {
-+    return -1;
-+  }
-+  if (request.latched == 0U || request.key == 0 || request.key > 0xFF) {
-+    return -1;
-+  }
-+  return static_cast<int>(request.key);
-+}
-+
 +}  // namespace
 +
 +auto agent_input_set_capture(bool on, size_t limit) -> void {
@@ -1493,32 +1310,20 @@ index 0000000..b303b29
 +  return taken;
 +}
 +
-+auto agent_input_record_key(const KeyboardEvent_t* event) -> void {
-+  if (!g_capturing || event == nullptr) {
++auto agent_input_record_key(uint32_t host_key, uint8_t apple_code, bool down)
++    -> void {
++  if (!g_capturing) {
 +    return;
 +  }
-+  const bool down = event->is_down != 0U;
-+  int code = -1;
++  int code = apple_code;
 +  if (down) {
-+    code = latched_key(event);
-+    if (code >= 0) {
-+      g_down_keys[event->key] = code;
-+    }
++    g_down_keys[host_key] = code;
 +  } else {
-+    const auto held = g_down_keys.find(event->key);
++    const auto held = g_down_keys.find(host_key);
 +    if (held != g_down_keys.end()) {
 +      code = held->second;
 +      g_down_keys.erase(held);
-+    } else {
-+      // Released a key that went down before anyone was recording.
-+      code = latched_key(event);
 +    }
-+  }
-+  if (code < 0) {
-+    // Function keys, modifiers and the rest of the frontend's own keys. They
-+    // never reach the Apple II as keystrokes, so logging them would put
-+    // something in a movie that replaying cannot reproduce.
-+    return;
 +  }
 +  push("key", code, down ? 1 : 0);
 +}
@@ -1532,17 +1337,15 @@ index 0000000..b303b29
 +}
 diff --git a/src/frontends/common/agent/AgentInput.h b/src/frontends/common/agent/AgentInput.h
 new file mode 100644
-index 0000000..b2cad12
+index 00000000..d1553ca3
 --- /dev/null
 +++ b/src/frontends/common/agent/AgentInput.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,59 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#pragma once
 +
 +#include <cstddef>
 +#include <cstdint>
-+
-+#include "apple2/peripherals/keyboard/KeyboardCommands.h"
 +
 +// A log of the input a person generated at the window.
 +//
@@ -1577,14 +1380,14 @@ index 0000000..b2cad12
 +// Takes up to `max` events off the front of the buffer.
 +auto agent_input_take(size_t max, AgentInputEvent_t* out) -> size_t;
 +
-+// Called by the frontends, with the event exactly as it was handed to the
-+// keyboard. What gets logged is the byte the keyboard says it will latch, not
-+// the key the frontend named: a person holding shift types `"`, and a movie
-+// that replayed the unshifted key would type `'` instead. The keyboard is
-+// asked, because only it knows the layout, the custom maps and the caps lock.
-+// A key that reaches the machine as nothing - a function key, a modifier, an
-+// Apple key - is not logged at all, since a replay could not send it.
-+auto agent_input_record_key(const KeyboardEvent_t* event) -> void;
++// Called by the frontends with the code they handed the keyboard. That is the
++// byte worth logging, not the key the frontend named: a person holding shift
++// types `"`, and a movie that replayed the unshifted key would type `'`
++// instead. host_key pairs a release with its press, as it does for the card.
++// A key the host does not translate - a function key, a modifier, an Apple
++// key - never gets here, since a replay could not send it.
++auto agent_input_record_key(uint32_t host_key, uint8_t apple_code, bool down)
++    -> void;
 +auto agent_input_record_joy_axis(int axis, int value) -> void;
 +auto agent_input_record_joy_button(int button, bool down) -> void;
 +
@@ -1592,14 +1395,14 @@ index 0000000..b2cad12
 +
 +// Without the agent module the frontends still call these, so they have to
 +// exist and cost nothing.
-+inline auto agent_input_record_key(const KeyboardEvent_t*) -> void {}
++inline auto agent_input_record_key(uint32_t, uint8_t, bool) -> void {}
 +inline auto agent_input_record_joy_axis(int, int) -> void {}
 +inline auto agent_input_record_joy_button(int, bool) -> void {}
 +
 +#endif
 diff --git a/src/frontends/common/agent/AgentServer.cpp b/src/frontends/common/agent/AgentServer.cpp
 new file mode 100644
-index 0000000..92d8cac
+index 00000000..92d8cac0
 --- /dev/null
 +++ b/src/frontends/common/agent/AgentServer.cpp
 @@ -0,0 +1,297 @@
@@ -1902,7 +1705,7 @@ index 0000000..92d8cac
 +}
 diff --git a/src/frontends/common/agent/AgentServer.h b/src/frontends/common/agent/AgentServer.h
 new file mode 100644
-index 0000000..bcc0acf
+index 00000000..bcc0acfa
 --- /dev/null
 +++ b/src/frontends/common/agent/AgentServer.h
 @@ -0,0 +1,23 @@
@@ -1930,231 +1733,65 @@ index 0000000..bcc0acf
 +auto agent_server_is_active() -> bool;
 +auto agent_server_client_count() -> int;
 diff --git a/src/frontends/common/sdl/JoystickFrontend.cpp b/src/frontends/common/sdl/JoystickFrontend.cpp
-index bc3341c..5ba75b5 100644
+index 76c31b2a..fe896d89 100644
 --- a/src/frontends/common/sdl/JoystickFrontend.cpp
 +++ b/src/frontends/common/sdl/JoystickFrontend.cpp
-@@ -10,8 +10,27 @@
+@@ -10,6 +10,7 @@
  #include "core/LinAppleCore.h"
- #include "apple2/peripherals/Peripheral.h"
  #include "core/Registry.h"
+ #include "frontends/common/JoystickConfig.h"
 +#include "frontends/common/agent/AgentInput.h"
- #include "frontends/common/sdl/SdlCompat.h"
  
-+namespace {
-+
-+// Every stick movement and button press the frontend produces goes through
-+// here. The agent socket cannot see a person playing at the window, so this is
+ namespace {
+ 
+@@ -128,8 +129,12 @@ auto device_button_lines(size_t joy_num, int button) -> uint8_t {
+                                       joy_config.joy_type[1]);
+ }
+ 
++// Every button and stick movement the frontend produces goes through these
++// two. The agent socket cannot see a person playing at the window, so this is
 +// where their input is handed to a recorder as well as to the machine.
-+auto submit_axis(const JoystickAxisPayload_t& payload) -> void {
-+  submit_axis(payload);
-+  agent_input_record_joy_axis(payload.joystick * 2 + payload.axis,
-+                              payload.value);
-+}
-+
-+auto submit_button(const JoystickButtonPayload_t& payload) -> void {
-+  submit_button(payload);
-+  agent_input_record_joy_button(payload.button, payload.down);
-+}
-+
-+}  // namespace
-+
- enum {
-   DEVICE_NONE = 0,
-   DEVICE_JOYSTICK = 1,
-@@ -207,10 +226,10 @@ void joy_frontend_update() {
-             joy1.get(), static_cast<int>(g_joyConfig.joy0_button_map[1]));
-       }
- 
--      JoystickButtonPayload_t pb0 = {0, b0, {0, 0}};
--      peripheral_command(0, JOY_CMD_SET_BUTTON, &pb0, sizeof(pb0));
--      JoystickButtonPayload_t pb1 = {1, b1, {0, 0}};
--      peripheral_command(0, JOY_CMD_SET_BUTTON, &pb1, sizeof(pb1));
-+      JoystickButtonPayload_t pb0 = {0, b0};
-+      submit_button(pb0);
-+      JoystickButtonPayload_t pb1 = {1, b1};
-+      submit_button(pb1);
- 
-       int x = (static_cast<int>(sdl_compat_get_joystick_axis(
-                    joy1.get(), static_cast<int>(g_joyConfig.joy_axis[0][0]))) -
-@@ -256,11 +275,11 @@ void joy_frontend_update() {
-       if (y > 255) y = 255;
- 
-       JoystickAxisPayload_t px = {
--          0, 0, static_cast<uint8_t>(x + g_frontend_pdl_trim_x), 0};
--      peripheral_command(0, JOY_CMD_SET_AXIS, &px, sizeof(px));
-+          0, 0, static_cast<uint8_t>(x + g_frontend_pdl_trim_x)};
-+      submit_axis(px);
-       JoystickAxisPayload_t py = {
--          0, 1, static_cast<uint8_t>(y + g_frontend_pdl_trim_y), 0};
--      peripheral_command(0, JOY_CMD_SET_AXIS, &py, sizeof(py));
-+          0, 1, static_cast<uint8_t>(y + g_frontend_pdl_trim_y)};
-+      submit_axis(py);
-     }
-   }
- 
-@@ -275,12 +294,12 @@ void joy_frontend_update() {
- 
-       bool b2 = sdl_compat_get_joystick_button(
-           joy2.get(), static_cast<int>(g_joyConfig.joy1_button_map));
--      JoystickButtonPayload_t pb2 = {2, b2, {0, 0}};
--      peripheral_command(0, JOY_CMD_SET_BUTTON, &pb2, sizeof(pb2));
-+      JoystickButtonPayload_t pb2 = {2, b2};
-+      submit_button(pb2);
-       if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1])).device !=
-           DEVICE_NONE) {
--        JoystickButtonPayload_t pb1 = {1, b2, {0, 0}};
--        peripheral_command(0, JOY_CMD_SET_BUTTON, &pb1, sizeof(pb1));
-+        JoystickButtonPayload_t pb1 = {1, b2};
-+        submit_button(pb1);
-       }
- 
-       int x = (static_cast<int>(sdl_compat_get_joystick_axis(
-@@ -300,10 +319,10 @@ void joy_frontend_update() {
-       if (y < 0) y = 0;
-       if (y > 255) y = 255;
- 
--      JoystickAxisPayload_t px = {1, 0, static_cast<uint8_t>(x), 0};
--      peripheral_command(0, JOY_CMD_SET_AXIS, &px, sizeof(px));
--      JoystickAxisPayload_t py = {1, 1, static_cast<uint8_t>(y), 0};
--      peripheral_command(0, JOY_CMD_SET_AXIS, &py, sizeof(py));
-+      JoystickAxisPayload_t px = {1, 0, static_cast<uint8_t>(x)};
-+      submit_axis(px);
-+      JoystickAxisPayload_t py = {1, 1, static_cast<uint8_t>(y)};
-+      submit_axis(py);
-     }
-   }
+ auto send_connector_switch(uint8_t line, bool down) -> void {
+   linapple_set_game_switch(line, down);
++  agent_input_record_joy_button(line, down);
  }
-@@ -418,40 +437,40 @@ auto joy_frontend_process_key(SdlKeycode_t virtkey, bool extended, bool down,
-       if (down) {
-         if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1])).device !=
-             DEVICE_KEYBOARD) {
--          JoystickButtonPayload_t p = {0, true, {0, 0}};
--          peripheral_command(0, JOY_CMD_SET_BUTTON, &p, sizeof(p));
-+          JoystickButtonPayload_t p = {0, true};
-+          submit_button(p);
-         } else if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1]))
-                        .device != DEVICE_NONE) {
--          JoystickButtonPayload_t p2 = {2, true, {0, 0}};
--          peripheral_command(0, JOY_CMD_SET_BUTTON, &p2, sizeof(p2));
--          JoystickButtonPayload_t p1 = {1, true, {0, 0}};
--          peripheral_command(0, JOY_CMD_SET_BUTTON, &p1, sizeof(p1));
-+          JoystickButtonPayload_t p2 = {2, true};
-+          submit_button(p2);
-+          JoystickButtonPayload_t p1 = {1, true};
-+          submit_button(p1);
-         }
-       } else {
-         if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1])).device !=
-             DEVICE_KEYBOARD) {
--          JoystickButtonPayload_t p = {0, false, {0, 0}};
--          peripheral_command(0, JOY_CMD_SET_BUTTON, &p, sizeof(p));
-+          JoystickButtonPayload_t p = {0, false};
-+          submit_button(p);
-         } else if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1]))
-                        .device != DEVICE_NONE) {
--          JoystickButtonPayload_t p2 = {2, false, {0, 0}};
--          peripheral_command(0, JOY_CMD_SET_BUTTON, &p2, sizeof(p2));
--          JoystickButtonPayload_t p1 = {1, false, {0, 0}};
--          peripheral_command(0, JOY_CMD_SET_BUTTON, &p1, sizeof(p1));
-+          JoystickButtonPayload_t p2 = {2, false};
-+          submit_button(p2);
-+          JoystickButtonPayload_t p1 = {1, false};
-+          submit_button(p1);
-         }
-       }
-     } else if ((virtkey == SDLK_KP_PERIOD) || (virtkey == SDLK_DELETE)) {
-       if (down) {
-         if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1])).device !=
-             DEVICE_KEYBOARD) {
--          JoystickButtonPayload_t p = {1, true, {0, 0}};
--          peripheral_command(0, JOY_CMD_SET_BUTTON, &p, sizeof(p));
-+          JoystickButtonPayload_t p = {1, true};
-+          submit_button(p);
-         }
-       } else {
-         if (joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[1])).device !=
-             DEVICE_KEYBOARD) {
--          JoystickButtonPayload_t p = {1, false, {0, 0}};
--          peripheral_command(0, JOY_CMD_SET_BUTTON, &p, sizeof(p));
-+          JoystickButtonPayload_t p = {1, false};
-+          submit_button(p);
-         }
-       }
-     } else if ((down && !autorep) || (centering_type == MODE_CENTERING)) {
-@@ -491,11 +510,11 @@ auto joy_frontend_process_key(SdlKeycode_t virtkey, bool extended, bool down,
-         y = static_cast<int>(PDL_CENTRAL) + g_frontend_pdl_trim_y;
-       }
-       JoystickAxisPayload_t px = {static_cast<uint8_t>(joy_num), 0,
--                                  static_cast<uint8_t>(x), 0};
--      peripheral_command(0, JOY_CMD_SET_AXIS, &px, sizeof(px));
-+                                  static_cast<uint8_t>(x)};
-+      submit_axis(px);
-       JoystickAxisPayload_t py = {static_cast<uint8_t>(joy_num), 1,
--                                  static_cast<uint8_t>(y), 0};
--      peripheral_command(0, JOY_CMD_SET_AXIS, &py, sizeof(py));
-+                                  static_cast<uint8_t>(y)};
-+      submit_axis(py);
-     }
-   }
-   return keychange;
-@@ -541,10 +560,10 @@ auto joy_frontend_process_mouse_motion(int x, int max_x, int y, int max_y)
-         (g_joyConfig.joy_type[joy_num] < joyinfo.size() &&
-          joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[joy_num]))
-                  .device == DEVICE_MOUSE)) {
--      JoystickAxisPayload_t px = {joy_num, 0, static_cast<uint8_t>(joy_x), 0};
--      peripheral_command(0, JOY_CMD_SET_AXIS, &px, sizeof(px));
--      JoystickAxisPayload_t py = {joy_num, 1, static_cast<uint8_t>(joy_y), 0};
--      peripheral_command(0, JOY_CMD_SET_AXIS, &py, sizeof(py));
-+      JoystickAxisPayload_t px = {joy_num, 0, static_cast<uint8_t>(joy_x)};
-+      submit_axis(px);
-+      JoystickAxisPayload_t py = {joy_num, 1, static_cast<uint8_t>(joy_y)};
-+      submit_axis(py);
-     }
-   }
+ 
+ auto send_connector_lines(uint8_t lines, bool down) -> void {
+@@ -211,6 +216,7 @@ auto send_axis(uint8_t joy_num, uint8_t axis, int position) -> void {
+       0,
+   };
+   peripheral_command(0, JOYSTICK_CMD_SET_AXIS, &payload, sizeof(payload));
++  agent_input_record_joy_axis((joy_num * 2) + axis, payload.value);
  }
-@@ -556,11 +575,11 @@ auto joy_frontend_process_mouse_button(int button, bool down) -> void {
-          joyinfo.at(static_cast<size_t>(g_joyConfig.joy_type[joy_num]))
-                  .device == DEVICE_MOUSE)) {
-       if (button == 0) {
--        JoystickButtonPayload_t pb0 = {0, down, {0, 0}};
--        peripheral_command(0, JOY_CMD_SET_BUTTON, &pb0, sizeof(pb0));
-+        JoystickButtonPayload_t pb0 = {0, down};
-+        submit_button(pb0);
-       } else if (button == 1) {
--        JoystickButtonPayload_t pb1 = {1, down, {0, 0}};
--        peripheral_command(0, JOY_CMD_SET_BUTTON, &pb1, sizeof(pb1));
-+        JoystickButtonPayload_t pb1 = {1, down};
-+        submit_button(pb1);
-       }
-     }
-   }
+ 
+ auto keypad_joystick() -> int {
 diff --git a/src/frontends/common/sdl/Keyboard.cpp b/src/frontends/common/sdl/Keyboard.cpp
-index ec20c07..77eecc5 100644
+index 0d564e64..33772bf0 100644
 --- a/src/frontends/common/sdl/Keyboard.cpp
 +++ b/src/frontends/common/sdl/Keyboard.cpp
-@@ -9,6 +9,7 @@
- #include "core/Registry.h"
+@@ -5,6 +5,7 @@
+ #include "core/LinAppleCore.h"
  #include "frontends/common/Frontend.h"
  #include "frontends/common/KeyboardTranslator.h"
 +#include "frontends/common/agent/AgentInput.h"
- #include "frontends/common/sdl/SdlCompat.h"
  
- static int keyboard_mapping_mode = 0;
-@@ -118,6 +119,9 @@ auto frontend_dispatch_key_event(uint32_t scancode, uint32_t keycode,
-                         mods.gui,
-                         {0, 0, 0}};
-   peripheral_command(0, keyboard_cmd_event, &ev, sizeof(ev));
+ // NOLINTBEGIN(misc-include-cleaner) : Keycodes (SDLK_*) are provided across SDL1/2/3 backends via SdlBackend.h
+ auto frontend_to_core_key(int key, uint32_t mod) -> LinAppleKey {
+@@ -89,6 +90,9 @@ auto frontend_dispatch_key_event(uint32_t scancode, uint32_t keycode,
+   // A host that reports no scancode leaves the keycode as the key's identity.
+   const uint32_t host_key = scancode != 0 ? scancode : keycode;
+   linapple_set_key(host_key, apple_code, is_down);
 +  // Everything a person types passes through here, which is where a recorder
 +  // on the socket can see it - it never sees the SDL event itself.
-+  agent_input_record_key(&ev);
++  agent_input_record_key(host_key, apple_code, is_down);
  }
  
- auto frontend_handle_key_event(SdlKeycode_t key, bool is_down) -> bool {
+ // Left Alt or Left GUI is Open Apple and Right Alt or Right GUI is Solid
 diff --git a/src/frontends/headless/Main.cpp b/src/frontends/headless/Main.cpp
-index ade9025..f0ffb33 100644
+index f4863714..9db6289b 100644
 --- a/src/frontends/headless/Main.cpp
 +++ b/src/frontends/headless/Main.cpp
-@@ -1,15 +1,110 @@
+@@ -1,26 +1,175 @@
  // SPDX-License-Identifier: GPL-2.0-only
 +#include <time.h>
 +
@@ -2164,18 +1801,18 @@ index ade9025..f0ffb33 100644
 +#include <string>
 +#include <vector>
  
-+#include "frontends/common/AudioMixer.h"
 +#include "apple2/CPU.h"
  #include "core/LinAppleCore.h"
+ #include "core/Registry.h"
  #include "frontends/common/AppArgs.h"
- #include "frontends/common/AppConfig.h"
  #include "frontends/common/AppController.h"
 +#include "frontends/common/AudioDumper.h"
++#include "frontends/common/AudioMixer.h"
 +#include "frontends/common/Frontend.h"
 +#include "frontends/common/agent/AgentServer.h"
-+
-+namespace {
-+
+ 
+ namespace {
+ 
 +constexpr int headless_warmup_frames = 60;
 +constexpr int apple2_frame_cycles = 17030;
 +constexpr int idle_poll_timeout_ms = 200;
@@ -2189,46 +1826,46 @@ index ade9025..f0ffb33 100644
 +constexpr uint32_t audio_dump_rate_hz = 44100;
 +constexpr uint32_t audio_dump_channels = 2;
 +
-+AudioDumper_t g_audio_dumper;
-+std::string g_audio_dump_path;
++AudioDumper audio_dumper;
++std::string audio_dump_path;
 +// With no device asking for samples, something has to say how much of the
 +// recording is due, and it cannot be how many samples a card handed over: a
 +// speaker that is not being toggled hands over nothing, and counting those
 +// would splice the quiet parts out and leave a file shorter than the session.
 +// The 6502's own cycle count is the clock instead, so what the file holds is
 +// emulated time - silence included - however fast the host ran it.
-+uint64_t g_audio_last_cycles = 0;
-+double g_audio_frames_owed = 0.0;
-+std::vector<int16_t> g_audio_scratch;
++uint64_t audio_last_cycles = 0;
++double audio_frames_owed = 0.0;
++std::vector<int16_t> audio_scratch;
 +
 +auto audio_dump_pull() -> void {
-+  if (!g_audio_dumper.is_active() || g_current_clk_6502 <= 0.0) {
++  const double clock_hz = linapple_get_clock_hz();
++  if (!audio_dumper.is_active() || clock_hz <= 0.0) {
 +    return;
 +  }
 +  const uint64_t now = cpu_get_cumulative_cycles();
-+  if (now <= g_audio_last_cycles) {
-+    g_audio_last_cycles = now;
++  if (now <= audio_last_cycles) {
++    audio_last_cycles = now;
 +    return;
 +  }
-+  g_audio_frames_owed += static_cast<double>(now - g_audio_last_cycles) *
-+                         (static_cast<double>(audio_dump_rate_hz) /
-+                          g_current_clk_6502);
-+  g_audio_last_cycles = now;
-+  const auto frames = static_cast<size_t>(g_audio_frames_owed);
++  audio_frames_owed += static_cast<double>(now - audio_last_cycles) *
++                       (static_cast<double>(audio_dump_rate_hz) / clock_hz);
++  audio_last_cycles = now;
++  const auto frames = static_cast<size_t>(audio_frames_owed);
 +  if (frames == 0) {
 +    return;
 +  }
-+  g_audio_frames_owed -= static_cast<double>(frames);
-+  g_audio_scratch.assign(frames * audio_dump_channels, 0);
-+  audio_mixer_get_samples(g_audio_scratch.data(), g_audio_scratch.size());
-+  audio_dumper_put_samples(&g_audio_dumper, g_audio_scratch.data(),
-+                           static_cast<uint32_t>(g_audio_scratch.size()));
++  audio_frames_owed -= static_cast<double>(frames);
++  audio_scratch.assign(frames * audio_dump_channels, 0);
++  audio_mixer_get_samples(audio_scratch.data(), audio_scratch.size());
++  audio_dumper_put_samples(&audio_dumper, audio_scratch.data(),
++                           static_cast<uint32_t>(audio_scratch.size()));
 +}
 +
 +// Without a socket the emulator has no one to talk to, so the machine only
 +// needs long enough to finish booting before the process reports back.
 +auto run_fixed_frames(int frames) -> void {
-+  for (int i = 0; i < frames; ++i) {
++  for (int i = 0; i < frames && system_state.mode != app_mode_exit; ++i) {
 +    linapple_run_frame(apple2_frame_cycles);
 +  }
 +}
@@ -2244,8 +1881,8 @@ index ade9025..f0ffb33 100644
 +// run_frames or turbo_set rather than getting it by accident here.
 +auto run_agent_loop() -> void {
 +  const timespec frame_gap = {0, frame_sleep_ns};
-+  while (g_state.mode != MODE_EXIT) {
-+    if (g_state.mode == MODE_RUNNING) {
++  while (system_state.mode != app_mode_exit) {
++    if (system_state.mode == app_mode_running) {
 +      agent_server_poll(0);
 +      linapple_run_frame(apple2_frame_cycles);
 +      if (!linapple_get_turbo()) {
@@ -2260,33 +1897,23 @@ index ade9025..f0ffb33 100644
 +  }
 +}
 +
-+}  // namespace
+ auto video_callback(const uint32_t* /*pixels*/, int /*width*/, int /*height*/,
+                     int /*pitch*/) -> void {}
  
--// NOLINTNEXTLINE(bugprone-easily-swappable-parameters): video callback
--// signature
- auto video_callback(const uint32_t* pixels, int width, int height, int pitch)
-     -> void {
-   (void)pixels;
-@@ -18,15 +113,64 @@ auto video_callback(const uint32_t* pixels, int width, int height, int pitch)
-   (void)pitch;
- }
- 
+-auto audio_callback(const char* /*peripheral_id*/, int /*slot*/,
+-                    const float* const* /*channels*/, size_t /*num_channels*/,
+-                    size_t /*num_samples*/) -> void {}
 +// Headless has no sound card, so this is where the machine's audio would
 +// otherwise be thrown away. Sent to a dumper instead, it becomes a recording of
 +// exactly what the emulation produced - and because the samples arrive on
 +// emulated time rather than a device's clock, a session replayed as fast as the
 +// host allows still writes a file that plays at the right speed.
- // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
- auto audio_callback(const char* peripheral_id, int slot,
-                     const float* const* channels, size_t num_channels,
-                     size_t num_samples) -> void {
--  (void)peripheral_id;
--  (void)slot;
--  (void)channels;
--  (void)num_channels;
--  (void)num_samples;
-+  if (!g_audio_dumper.is_active() || channels == nullptr ||
-+      num_channels == 0 || num_samples == 0) {
++// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
++auto audio_callback(const char* peripheral_id, int slot,
++                    const float* const* channels, size_t num_channels,
++                    size_t num_samples) -> void {
++  if (!audio_dumper.is_active() || channels == nullptr || num_channels == 0 ||
++      num_samples == 0) {
 +    return;
 +  }
 +  audio_mixer_upload_channels(peripheral_id, slot, channels, num_channels,
@@ -2295,49 +1922,55 @@ index ade9025..f0ffb33 100644
 +}
 +
 +auto audio_source_registered(int slot, const char* peripheral_id,
-+                             const PeripheralAudioInfo_t* info) -> void {
++                             const PeripheralAudioInfo* info) -> void {
 +  audio_mixer_register_source(slot, peripheral_id, info);
 +}
 +
 +auto audio_source_unregistered(int slot) -> void {
 +  audio_mixer_unregister_source(slot);
 +}
-+
+ 
+ auto title_callback(const char* /*title*/) -> void {}
+ 
+ }  // namespace
+ 
 +auto frontend_audio_dump_start(const char* path) -> bool {
 +  if (path == nullptr || *path == '\0') {
 +    return false;
 +  }
 +  frontend_audio_dump_stop();
-+  if (audio_dumper_initialize(&g_audio_dumper, path, audio_dump_rate_hz,
++  if (audio_dumper_initialize(&audio_dumper, path, audio_dump_rate_hz,
 +                              audio_dump_channels) != 0) {
 +    return false;
 +  }
 +  // Whatever the mixer buffered before anyone was recording is not part of this
 +  // recording.
 +  audio_mixer_clear_buffers();
-+  g_audio_frames_owed = 0.0;
-+  g_audio_last_cycles = cpu_get_cumulative_cycles();
-+  g_audio_dump_path = path;
++  audio_frames_owed = 0.0;
++  audio_last_cycles = cpu_get_cumulative_cycles();
++  audio_dump_path = path;
 +  return true;
 +}
 +
 +auto frontend_audio_dump_stop() -> void {
-+  if (g_audio_dumper.is_active()) {
++  if (audio_dumper.is_active()) {
 +    // Whatever ran since the last card spoke is still part of the session, so
 +    // the quiet tail is written before the file is closed.
 +    audio_dump_pull();
 +    // Finalizing writes the RIFF sizes, which is what makes the file playable.
-+    audio_dumper_finalize(&g_audio_dumper);
++    audio_dumper_finalize(&audio_dumper);
 +  }
-+  g_audio_dump_path.clear();
++  audio_dump_path.clear();
 +}
 +
 +auto frontend_audio_dump_path() -> const char* {
-+  return g_audio_dumper.is_active() ? g_audio_dump_path.c_str() : "";
- }
- 
- auto title_callback(const char* title) -> void { (void)title; }
-@@ -49,20 +193,50 @@ auto main(int argc, char** argv) -> int {
++  return audio_dumper.is_active() ? audio_dump_path.c_str() : "";
++}
++
+ auto main(int argc, char** argv) -> int {
+   AppConfig& config = Configuration::instance();
+   if (app_args_parse(argc, argv, &config) != 0) {
+@@ -39,21 +188,50 @@ auto main(int argc, char** argv) -> int {
  
    linapple_set_video_callback(video_callback);
    linapple_set_audio_channel_callback(audio_callback);
@@ -2350,7 +1983,7 @@ index ade9025..f0ffb33 100644
  
    app_controller_load_initial_media(&config);
  
--  constexpr int HEADLESS_FRAMES = 60;
+-  constexpr int headless_frames = 60;
 -  constexpr int apple2_frame_cycles = 17030;
 +  if (config.audio_dump_path.at(0) != '\0') {
 +    if (!frontend_audio_dump_start(config.audio_dump_path.data())) {
@@ -2363,7 +1996,8 @@ index ade9025..f0ffb33 100644
 +              << std::endl;
 +  }
  
--  for (int i = 0; i < HEADLESS_FRAMES; ++i) {
+-  for (int i = 0; i < headless_frames && system_state.mode != app_mode_exit;
+-       ++i) {
 -    linapple_run_frame(apple2_frame_cycles);
 +  const bool agent_requested = config.agent_socket_path.at(0) != '\0';
 +  if (agent_requested &&
@@ -2393,7 +2027,7 @@ index ade9025..f0ffb33 100644
  
    std::cout << "Headless execution complete." << std::endl;
 diff --git a/src/frontends/sdl3/Main.cpp b/src/frontends/sdl3/Main.cpp
-index bbd6b75..878d1cc 100644
+index 69fdb6bb..051be03c 100644
 --- a/src/frontends/sdl3/Main.cpp
 +++ b/src/frontends/sdl3/Main.cpp
 @@ -20,6 +20,7 @@
@@ -2403,10 +2037,10 @@ index bbd6b75..878d1cc 100644
 +#include "frontends/common/agent/AgentServer.h"
  #include "frontends/common/sdl/JoystickFrontend.h"
  #include "frontends/sdl3/Frame.h"
+ #include "frontends/sdl3/SdlPtr.h"
+@@ -62,6 +63,34 @@ auto SDLCALL sdl3_audio_callback(void* userdata, SDL_AudioStream* stream,
  
-@@ -53,6 +54,35 @@ static void SDLCALL sdl3_audio_callback(void* userdata, SDL_AudioStream* stream,
-   SDL_free(temp_buf);
- }
+ }  // namespace
  
 +// Starting and stopping the recording while the machine runs, rather than only
 +// from the command line. What is dumped here is the mixer's output - the same
@@ -2418,47 +2052,50 @@ index bbd6b75..878d1cc 100644
 +    return false;
 +  }
 +  frontend_audio_dump_stop();
-+  if (audio_dumper_initialize(&g_audio_dumper, path, SPKR_SAMPLE_RATE, 2) !=
-+      0) {
++  if (audio_dumper_initialize(&audio_dumper, path, 44100, 2) != 0) {
 +    return false;
 +  }
-+  g_audio_dump_file = path;
++  audio_dump_file = path;
 +  return true;
 +}
 +
 +auto frontend_audio_dump_stop() -> void {
-+  if (g_audio_dumper.is_active()) {
-+    audio_dumper_finalize(&g_audio_dumper);
++  if (audio_dumper.is_active()) {
++    audio_dumper_finalize(&audio_dumper);
 +  }
-+  g_audio_dump_file.clear();
++  audio_dump_file.clear();
 +}
 +
 +auto frontend_audio_dump_path() -> const char* {
-+  return g_audio_dumper.is_active() ? g_audio_dump_file.c_str() : "";
++  return audio_dumper.is_active() ? audio_dump_file.c_str() : "";
 +}
 +
  auto ds_init() -> bool {
-   if (g_audioStream) return true;
+   if (audio_stream != nullptr) {
+     return true;
+@@ -150,11 +179,21 @@ auto sys_input() -> void {
  
-@@ -142,19 +172,31 @@ void sys_input() {
- 
- void enter_message_loop() {
-   FramePacer_t pacer;
+ auto enter_message_loop() -> void {
+   FramePacer pacer;
 +  // While an agent has the machine parked there are no frames to produce, so
 +  // the loop waits inside the socket poll instead of spinning at 60 Hz for
 +  // nothing. That both cuts idle wakeups and shortens the round trip, since a
 +  // command wakes the loop the moment it lands rather than at the next tick.
 +  constexpr int paused_poll_ms = 30;
-   while (g_state.mode != MODE_EXIT) {
+   while (system_state.mode != app_mode_exit) {
      sys_input();
+     if (system_state.mode == app_mode_exit) {
+       break;
+     }
 +
-+    const bool parked =
-+        g_state.mode == MODE_PAUSED && agent_server_client_count() > 0;
++    const bool parked = system_state.mode == app_mode_paused &&
++                        agent_server_client_count() > 0;
 +    agent_server_poll(parked ? paused_poll_ms : 0);
 +
      joy_frontend_update();
  
-     uint32_t cycles = linapple_get_frame_cycles();
+     if (system_state.reset_timing) {
+@@ -166,11 +205,13 @@ auto enter_message_loop() -> void {
      linapple_run_frame(cycles);
      draw_frame_window();
  
@@ -2475,9 +2112,9 @@ index bbd6b75..878d1cc 100644
      }
    }
  }
-@@ -179,6 +221,13 @@ auto main(int argc, char** argv) -> int {
- 
-   if (sys_init() != 0) return 1;
+@@ -195,6 +236,13 @@ auto main(int argc, char** argv) -> int {
+     return 1;
+   }
  
 +  if (config.agent_socket_path.at(0) != '\0') {
 +    if (agent_server_start(config.agent_socket_path.data()) != 0) {
@@ -2489,7 +2126,7 @@ index bbd6b75..878d1cc 100644
    do {
      app_controller_set_restart(false);
  
-@@ -200,6 +249,7 @@ auto main(int argc, char** argv) -> int {
+@@ -216,6 +264,7 @@ auto main(int argc, char** argv) -> int {
      session_shutdown();
    } while (app_controller_should_restart());
  
@@ -2497,31 +2134,12 @@ index bbd6b75..878d1cc 100644
    sys_shutdown();
    return 0;
  }
-diff --git a/src/frontends/tui/TuiInput.cpp b/src/frontends/tui/TuiInput.cpp
-index 31e00b0..922b6e8 100644
---- a/src/frontends/tui/TuiInput.cpp
-+++ b/src/frontends/tui/TuiInput.cpp
-@@ -562,7 +562,13 @@ auto tui_input_poll() -> void {
-     struct js_event js{};
-     while (read(g_joy_fd, &js, sizeof(js)) > 0) {
-       if ((js.type & JS_EVENT_AXIS) != 0) {
--        linapple_set_joystick_axis(js.number, js.value);
-+        // A Linux joystick reports -32767..32767 while a paddle is 0..255 with
-+        // 127 at rest, and there is nowhere to put an axis past the second
-+        // stick.
-+        if (js.number <= 3) {
-+          const int position = (static_cast<int>(js.value) + 32768) >> 8;
-+          linapple_set_joystick_axis(js.number, position);
-+        }
-       } else if ((js.type & JS_EVENT_BUTTON) != 0) {
-         linapple_set_joystick_button(js.number, js.value);
-       }
 diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
 new file mode 100644
-index 0000000..c5a50f4
+index 00000000..d0fdb4fc
 --- /dev/null
 +++ b/tests/test_agent_commands.cpp
-@@ -0,0 +1,1032 @@
+@@ -0,0 +1,1020 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +//
 +// Agent control-channel tests.
@@ -2550,11 +2168,13 @@ index 0000000..c5a50f4
 +
 +#include "apple2/CPU.h"
 +#include "apple2/Memory.h"
++#include "apple2/SwitchInputs.h"
 +#include "apple2/Video.h"
 +#include "apple2/peripherals/disk/DiskCommands.h"
 +#include "apple2/peripherals/joystick/JoystickCommands.h"
 +#include "apple2/peripherals/keyboard/KeyboardCommands.h"
 +#include "core/LinAppleCore.h"
++#include "frontends/common/KeyboardTranslator.h"
 +#include "apple2/peripherals/Peripheral.h"
 +#include "doctest.h"
 +#include "test_fixtures.h"
@@ -2567,7 +2187,7 @@ index 0000000..c5a50f4
 +using Json = nlohmann::json;
 +// The harness takes the machine it should come up as; a Disk II in slot 6
 +// is what the disk commands need and costs the other cases nothing.
-+using TestConfig_t = TestFixtures::ScopedTestConfig_t;
++using TestConfig = TestFixtures::ScopedTestConfig;
 +
 +// Whether a frontend can record at all is the frontend's business; what the
 +// command has to get right is refusing a request it cannot honour and saying
@@ -2605,24 +2225,17 @@ index 0000000..c5a50f4
 +  return parsed;
 +}
 +
-+// What a frontend hands the keyboard when a person presses a key. The mods
-+// travel with the event, which is how the keyboard knows a held shift turns
-+// `p` into `P`.
-+auto key_event(uint32_t key, bool down, bool shift = false, bool ctrl = false)
-+    -> KeyboardEvent_t {
-+  return KeyboardEvent_t{key,
-+                         static_cast<uint8_t>(down ? 1 : 0),
-+                         static_cast<uint8_t>(shift ? 1 : 0),
-+                         static_cast<uint8_t>(ctrl ? 1 : 0),
-+                         0,
-+                         0,
-+                         {0, 0, 0}};
-+}
-+
++// What a frontend does when a person presses a key: the host translates it,
++// and only a key with an Apple meaning reaches the card - and the recorder.
++// The mods travel with the key, which is how a held shift turns `p` into `P`.
 +auto record_key(uint32_t key, bool down, bool shift = false, bool ctrl = false)
 +    -> void {
-+  const KeyboardEvent_t event = key_event(key, down, shift, ctrl);
-+  agent_input_record_key(&event);
++  const KeyboardHostKey host_key = {0, key, shift, ctrl};
++  uint8_t apple_code = 0;
++  if (!keyboard_translate(&host_key, &apple_code)) {
++    return;
++  }
++  agent_input_record_key(key, apple_code, down);
 +}
 +
 +auto command(const char* cmd, const Json& params = Json::object()) -> Json {
@@ -2670,23 +2283,6 @@ index 0000000..c5a50f4
 +  *cell = value;
 +}
 +
-+// The joystick has no query of its own, so its save state is how a test sees
-+// where the sticks actually are. Input commands are queued rather than applied
-+// on the spot - they land when the machine next runs - so the queue is drained
-+// first, which is what the next run_frames would have done.
-+auto joystick_state_raw() -> JoystickSaveState_t {
-+  JoystickSaveState_t state = {};
-+  size_t size = sizeof(state);
-+  peripheral_save_state_by_name(0, "Joystick", &state, &size);
-+  REQUIRE(size == sizeof(state));
-+  return state;
-+}
-+
-+auto joystick_state() -> JoystickSaveState_t {
-+  peripheral_manager_think(0);
-+  return joystick_state_raw();
-+}
-+
 +auto screen_hash() -> uint64_t {
 +  return ok_result("screen_hash").at("hash").get<uint64_t>();
 +}
@@ -2698,7 +2294,7 @@ index 0000000..c5a50f4
 +  for (size_t i = 0; i < code.size(); ++i) {
 +    poke(static_cast<uint16_t>(address + i), code.at(i));
 +  }
-+  CpuRegisters_t* regs = cpu_get_registers();
++  CpuRegisters* regs = cpu_get_registers();
 +  REQUIRE(regs != nullptr);
 +  regs->pc = address;
 +  regs->is_jammed = 0;
@@ -2728,6 +2324,45 @@ index 0000000..c5a50f4
 +    0xEE, 0x00, 0x04,  // INC $0400
 +    0x4C, 0x00, 0x03   // JMP $0300
 +};
++
++// The game port keeps no positions a test can ask for, so a test reads a stick
++// the way a program does: the monitor's PREAD loop, copied here so it does not
++// depend on which ROM bank the machine left in, counts how long the paddle's
++// timer stays high. This reads one paddle over and over into the top-left
++// cell, so after a frame the cell holds where the stick was during it.
++auto program_read_paddle(uint8_t paddle) -> std::vector<uint8_t> {
++  return {
++      0xA2, paddle,      // LDX #paddle
++      0xAD, 0x70, 0xC0,  // LDA $C070   trigger the timers
++      0xA0, 0x00,        // LDY #0
++      0xEA, 0xEA,        // NOP NOP
++      0xBD, 0x64, 0xC0,  // LDA $C064,X
++      0x10, 0x04,        // BPL $0312   fallen: Y is the count
++      0xC8,              // INY
++      0xD0, 0xF8,        // BNE $0309
++      0x88,              // DEY         stayed high past 255
++      0x8C, 0x00, 0x04,  // STY $0400
++      0x4C, 0x00, 0x03   // JMP $0300
++  };
++}
++
++// Where the program saw the stick, after `frames` frames of reading it. PREAD
++// counts in steps of about eleven cycles, so a position comes back within a
++// count or two of what was sent.
++auto paddle_read(uint8_t paddle, int frames = 2) -> int {
++  run_program(0x0300, program_read_paddle(paddle));
++  ok_result("run_frames", {{"frames", frames}});
++  const uint8_t* cell = mem_get_main_ptr(0x0400);
++  REQUIRE(cell != nullptr);
++  return *cell;
++}
++
++auto near(int read, int sent) -> bool {
++  return read >= sent - 3 && read <= sent + 3;
++}
++
++// A button is a switch on the game connector's line; true is pressed.
++auto button_down(uint8_t line) -> bool { return switch_inputs_level(line); }
 +
 +auto wait_params(int64_t max_frames, int64_t chunk) -> Json {
 +  Json params;
@@ -2893,8 +2528,8 @@ index 0000000..c5a50f4
 +// --- parameter ranges ------------------------------------------------------
 +
 +TEST_CASE("Agent: mem_read refuses addresses outside the address space") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +
 +  CHECK(rejects("mem_read", {{"addr", -1}}));
 +  CHECK(rejects("mem_read", {{"addr", 0x10000}}));
@@ -2914,8 +2549,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: mem_read returns what memory holds") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +
 +  poke(0x6000, 0xDE);
 +  poke(0x6001, 0xAD);
@@ -2929,8 +2564,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: mem_write refuses a payload it cannot place") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +
 +  CHECK(rejects("mem_write", {{"addr", -1}, {"bytes", {1}}}));
 +  CHECK(rejects("mem_write", {{"addr", 0x10000}, {"bytes", {1}}}));
@@ -2950,8 +2585,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: disk_insert checks the drive and the path length") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +
 +  CHECK(rejects("disk_insert", {{"drive", 0}}));  // no path
 +  CHECK(rejects("disk_insert", {{"path", ""}, {"drive", 0}}));
@@ -2983,8 +2618,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: the remaining bounded parameters refuse their edges") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +
 +  CHECK(rejects("key_press", {{"key", -1}}));
 +  CHECK(rejects("key_press", {{"key", 256}}));
@@ -2999,43 +2634,39 @@ index 0000000..c5a50f4
 +  CHECK(rejects("run_frames", {{"frames", -1}}));
 +  CHECK(rejects("run_frames", {{"frames", 60 * 60 * 10 + 1}}));
 +
-+  CHECK(rejects("speed_set", {{"speed", SPEED_MIN - 1}}));
++  CHECK(rejects("speed_set", {{"speed", emulation_speed_min - 1}}));
 +  CHECK(rejects("speed_set", {{"speed", emulation_speed_max + 1}}));
-+  CHECK(ok_result("speed_set", {{"speed", SPEED_NORMAL}}).at("speed") ==
-+        SPEED_NORMAL);
++  CHECK(ok_result("speed_set", {{"speed", emulation_speed_normal}}).at("speed") ==
++        emulation_speed_normal);
 +}
 +
 +// --- joystick --------------------------------------------------------------
 +
 +TEST_CASE("Agent: joy_axis puts each stick where it was told") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
++  select_text_page1();
 +
-+  const JoystickSaveState_t rest = joystick_state();
-+  CHECK(rest.x_pos[0] == 127);
-+  CHECK(rest.y_pos[1] == 127);
++  CHECK(near(paddle_read(0), 127));
++  CHECK(near(paddle_read(3), 127));
 +
 +  ok_result("joy_axis", {{"axis", 0}, {"value", 0}});
 +  ok_result("joy_axis", {{"axis", 1}, {"value", 255}});
 +  ok_result("joy_axis", {{"axis", 2}, {"value", 40}});
 +  ok_result("joy_axis", {{"axis", 3}, {"value", 200}});
 +
-+  const JoystickSaveState_t moved = joystick_state();
-+  CHECK(moved.x_pos[0] == 0);
-+  CHECK(moved.y_pos[0] == 255);
++  CHECK(near(paddle_read(0), 0));
++  CHECK(paddle_read(1) == 255);
 +  // The second stick is its own. Driving trim instead of position folded these
 +  // two onto the first stick's axes, and both sticks moved together.
-+  CHECK(moved.x_pos[1] == 40);
-+  CHECK(moved.y_pos[1] == 200);
-+
-+  // Trim is the user's calibration, and no amount of stick movement touches it.
-+  CHECK(moved.trim_x == 0);
-+  CHECK(moved.trim_y == 0);
++  CHECK(near(paddle_read(2), 40));
++  CHECK(near(paddle_read(3), 200));
 +}
 +
 +TEST_CASE("Agent: joy_axis takes a position, not a nudge") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
++  select_text_page1();
 +
 +  CHECK(rejects("joy_axis", {{"axis", 0}}));  // a missing value is not centre
 +  CHECK(rejects("joy_axis", {{"axis", 0}, {"value", -1}}));
@@ -3043,25 +2674,23 @@ index 0000000..c5a50f4
 +  CHECK(rejects("joy_axis", {{"axis", 4}, {"value", 127}}));
 +
 +  // A refused call leaves the sticks alone.
-+  const JoystickSaveState_t after = joystick_state();
-+  CHECK(after.x_pos[0] == 127);
-+  CHECK(after.y_pos[0] == 127);
++  CHECK(near(paddle_read(0), 127));
++  CHECK(near(paddle_read(1), 127));
 +}
 +
 +TEST_CASE("Agent: joy_button covers the three the machine has") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +
 +  for (int button = 0; button <= 2; ++button) {
 +    ok_result("joy_button", {{"button", button}, {"down", true}});
 +  }
-+  const JoystickSaveState_t pressed = joystick_state();
-+  CHECK(pressed.buttons[0] == 1);
-+  CHECK(pressed.buttons[1] == 1);
-+  CHECK(pressed.buttons[2] == 1);
++  CHECK(button_down(0));
++  CHECK(button_down(1));
++  CHECK(button_down(2));
 +
 +  ok_result("joy_button", {{"button", 1}, {"down", false}});
-+  CHECK(joystick_state().buttons[1] == 0);
++  CHECK_FALSE(button_down(1));
 +
 +  // There is no fourth button: the peripheral dropped it and the call still
 +  // answered ok, which read as a press that never happened.
@@ -3069,22 +2698,26 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: input lands when the machine next runs") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  select_text_page1();
-+  run_program(0x0300, program_idle);
++  CHECK(near(paddle_read(0), 127));
 +
 +  ok_result("joy_axis", {{"axis", 0}, {"value", 0}});
-+  // Queued, not applied: the peripheral has not been asked to think yet.
-+  CHECK(joystick_state_raw().x_pos[0] == 127);
++  // Queued, not applied: the frame that delivers it has already run its
++  // cycles, so the program reads the old position throughout.
++  ok_result("run_frames", {{"frames", 1}});
++  const uint8_t* cell = mem_get_main_ptr(0x0400);
++  REQUIRE(cell != nullptr);
++  CHECK(near(*cell, 127));
 +
 +  ok_result("run_frames", {{"frames", 1}});
-+  CHECK(joystick_state_raw().x_pos[0] == 0);
++  CHECK(near(*cell, 0));
 +}
 +
 +TEST_CASE("Agent: a program sees an input on the frame after it was sent") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  select_text_page1();
 +  run_program(0x0300, program_watch_keyboard);
 +
@@ -3106,29 +2739,30 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: a keystroke does not move the joystick") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
++  select_text_page1();
 +
 +  ok_result("joy_button", {{"button", 1}, {"down", true}});
-+  CHECK(joystick_state().buttons[1] == 1);
++  CHECK(button_down(1));
 +
-+  // Slot 0 is shared and the command ids overlap: a keyboard event carries the
-+  // same id as a joystick button press, and every peripheral in the slot is
-+  // offered every command. Read as a button payload, key code $01 is button 1
-+  // and the byte after it - the high half of a 32-bit key - is a release.
++  // Slot 0 is shared, and every peripheral in it is offered every command.
++  // Before the subsystems a keyboard event carried the same id as a joystick
++  // button press, and key code $01 read as button 1 being let go.
 +  ok_result("key_state", {{"key", 0x01}, {"down", true}});
-+  CHECK(joystick_state().buttons[1] == 1);
++  ok_result("run_frames", {{"frames", 1}});
++  CHECK(button_down(1));
 +
 +  ok_result("joy_axis", {{"axis", 0}, {"value", 90}});
 +  ok_result("key_type", {{"text", "AB"}, {"frames_between", 1}});
-+  CHECK(joystick_state().x_pos[0] == 90);
++  CHECK(near(paddle_read(0), 90));
 +}
 +
 +// --- screen hash -----------------------------------------------------------
 +
 +TEST_CASE("Agent: screen_hash watches the text page in text mode") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  select_text_page1();
 +
 +  const Json described = ok_result("screen_hash");
@@ -3155,8 +2789,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: screen_hash watches the hi-res page in graphics mode") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  select_text_page1();
 +  touch_switch(0xC050);  // graphics
 +  touch_switch(0xC057);  // hi-res
@@ -3174,8 +2808,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: screen_hash stays on hi-res in mixed mode") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  select_text_page1();
 +  touch_switch(0xC050);  // graphics
 +  touch_switch(0xC057);  // hi-res
@@ -3192,8 +2826,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: screen_hash follows the displayed page") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  select_text_page1();
 +
 +  const uint64_t page1 = screen_hash();
@@ -3216,8 +2850,8 @@ index 0000000..c5a50f4
 +// --- waiting for the screen ------------------------------------------------
 +
 +TEST_CASE("Agent: run_until_change spends its whole budget on a still screen") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  select_text_page1();
 +  run_program(0x0300, program_idle);
 +
@@ -3228,8 +2862,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: run_until_change returns once the screen settles") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  select_text_page1();
 +  const uint64_t before = screen_hash();
 +  run_program(0x0300, program_draw_once);
@@ -3245,8 +2879,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: run_until_change gives up on a screen that never settles") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  select_text_page1();
 +  run_program(0x0300, program_draw_forever);
 +
@@ -3256,8 +2890,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: run_until_change refuses a budget it cannot honour") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +
 +  CHECK(rejects("run_until_change", {{"max_frames", -1}}));
 +  CHECK(rejects("run_until_change", {{"max_frames", 60 * 60 * 10 + 1}}));
@@ -3268,8 +2902,8 @@ index 0000000..c5a50f4
 +// --- the input log ---------------------------------------------------------
 +
 +TEST_CASE("Agent: nothing is logged until a client asks for it") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  agent_input_set_capture(false, 0);
 +
 +  record_key(0x41, true);
@@ -3281,8 +2915,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: input_poll hands over what the window did") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  ok_result("input_capture", {{"on", true}});
 +
 +  // What the frontends call when a person types and moves the stick.
@@ -3310,8 +2944,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: only keys a client could send back are logged") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  ok_result("input_capture", {{"on", true}});
 +
 +  // The arrows arrive as LinAppleKey values a client cannot send, so they are
@@ -3335,13 +2969,13 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: what is logged is the byte the machine will see") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  ok_result("input_capture", {{"on", true}});
 +
 +  // Shift is not something a client can send. It changes what the key held
-+  // with it turns into, and only the keyboard knows into what - so the log has
-+  // to carry the result, not the key the frontend named.
++  // with it turns into, so the log has to carry the result, not the key the
++  // frontend named.
 +  record_key('p', true, /*shift=*/true);
 +  record_key('p', false);  // shift let go first, as a person's hand does
 +  record_key('8', true, /*shift=*/true);
@@ -3359,37 +2993,9 @@ index 0000000..c5a50f4
 +  agent_input_set_capture(false, 0);
 +}
 +
-+TEST_CASE("Keyboard: the translate query answers without pressing anything") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
-+  select_text_page1();
-+  run_program(0x0300, program_watch_keyboard);
-+
-+  KeyboardTranslate_t request{};
-+  request.event = key_event('1', true, /*shift=*/true);
-+  size_t size = sizeof(request);
-+  REQUIRE(peripheral_query(0, keyboard_query_translate, &request, &size) ==
-+          peripheral_ok);
-+  CHECK(request.latched == 1U);
-+  CHECK(request.key == '!');
-+
-+  // A key the machine never gets: a function key has no byte to latch.
-+  request.event = key_event(0x200, true);
-+  size = sizeof(request);
-+  REQUIRE(peripheral_query(0, keyboard_query_translate, &request, &size) ==
-+          peripheral_ok);
-+  CHECK(request.latched == 0U);
-+
-+  // Asking is not pressing: the program watching $C000 still sees nothing.
-+  ok_result("run_frames", {{"frames", 2}});
-+  const uint8_t* cell = mem_get_main_ptr(0x0400);
-+  REQUIRE(cell != nullptr);
-+  CHECK((*cell & 0x80) == 0);
-+}
-+
 +TEST_CASE("Agent: a full buffer says how much it lost") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  ok_result("input_capture", {{"on", true}, {"limit", 4}});
 +
 +  for (int i = 0; i < 10; ++i) {
@@ -3411,8 +3017,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: the input log stamps the cycle it happened on") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  select_text_page1();
 +  run_program(0x0300, program_idle);
 +  ok_result("input_capture", {{"on", true}});
@@ -3433,8 +3039,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: audio_dump starts, reports and stops") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +
 +  // Nothing is being recorded until someone asks.
 +  Json result = ok_result("audio_dump", {{"on", false}});
@@ -3457,8 +3063,8 @@ index 0000000..c5a50f4
 +}
 +
 +TEST_CASE("Agent: the input commands check their sizes") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +
 +  CHECK(rejects("input_capture", {{"on", true}, {"limit", -1}}));
 +  CHECK(rejects("input_capture", {{"on", true}, {"limit", (1 << 20) + 1}}));

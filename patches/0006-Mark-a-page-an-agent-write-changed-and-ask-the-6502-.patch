@@ -1,7 +1,7 @@
-From dec14ae8c5d1ef39f12e5ef95591a9164dcbe7b1 Mon Sep 17 00:00:00 2001
+From 669a0a6c3b92487acc59b4c97c5129bec936808f Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 01:40:44 +0900
-Subject: [PATCH 8/9] Mark a page an agent write changed, and ask the 6502
+Subject: [PATCH 6/7] Mark a page an agent write changed, and ask the 6502
  about it
 
 mem_write has been dropping writes. When the page a write lands on is the one
@@ -41,9 +41,11 @@ $D000-$DFFF and bank 1 $1000 lower, so "main" at $DA80 is bank 2 and "main" at
 $CA80 is bank 1. That is the $CA80 that sat in the notes as if it were an
 address of its own.
 
-51 cases.
+45 cases.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/apple2/Memory.cpp                        |  15 +
  src/apple2/Memory.h                          |   1 +
@@ -52,12 +54,12 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  4 files changed, 318 insertions(+), 4 deletions(-)
 
 diff --git a/src/apple2/Memory.cpp b/src/apple2/Memory.cpp
-index b10cf32..3b05fc3 100644
+index 555984fc..0364f349 100644
 --- a/src/apple2/Memory.cpp
 +++ b/src/apple2/Memory.cpp
-@@ -1045,6 +1045,21 @@ auto mem_get_cx_rom_peripheral() -> uint8_t* {
+@@ -992,6 +992,21 @@ auto mem_refresh_cx_page(int slot) noexcept -> void {
  
- auto get_mem_ptr(uint16_t addr) -> uint8_t* { return mem + addr; }
+ auto get_mem_ptr(uint16_t addr) noexcept -> uint8_t* { return mem + addr; }
  
 +// Says that the page holding `addr` has been changed in the live image.
 +//
@@ -78,19 +80,19 @@ index b10cf32..3b05fc3 100644
  
  // Post:
 diff --git a/src/apple2/Memory.h b/src/apple2/Memory.h
-index 1c08bb9..cd238a5 100644
+index 12742a9a..bde0228a 100644
 --- a/src/apple2/Memory.h
 +++ b/src/apple2/Memory.h
-@@ -239,6 +239,7 @@ auto mem_get_aux_ptr(uint16_t addr) -> uint8_t*;
- auto mem_get_main_ptr(uint16_t addr) -> uint8_t*;
- auto mem_get_cx_rom_peripheral() -> uint8_t*;
- auto get_mem_ptr(uint16_t addr) -> uint8_t*;
+@@ -233,6 +233,7 @@ auto mem_get_main_ptr(uint16_t addr) noexcept -> uint8_t*;
+ auto mem_get_cx_rom_peripheral() noexcept -> uint8_t*;
+ auto mem_refresh_cx_page(int slot) noexcept -> void;
+ auto get_mem_ptr(uint16_t addr) noexcept -> uint8_t*;
 +auto mem_mark_dirty(uint16_t addr) -> void;
- auto mem_get_bank_ptr(const uint32_t bank) -> uint8_t*;
- auto get_mem_mode() -> uint32_t;
- auto set_mem_mode(uint32_t mode) -> void;
+ inline auto mem_get_ptr(uint16_t addr) noexcept -> uint8_t* {
+   return get_mem_ptr(addr);
+ }
 diff --git a/src/frontends/common/agent/AgentCommands.cpp b/src/frontends/common/agent/AgentCommands.cpp
-index a1349e7..2c60787 100644
+index d4f9d284..3dc84784 100644
 --- a/src/frontends/common/agent/AgentCommands.cpp
 +++ b/src/frontends/common/agent/AgentCommands.cpp
 @@ -164,6 +164,30 @@ auto memory_view_ptr(const std::string& view, uint16_t address) -> uint8_t* {
@@ -124,7 +126,7 @@ index a1349e7..2c60787 100644
  // Reads the view a memory command asked for, defaulting to what the old
  // `aux` flag meant. Returns false for a name that is not one of the three.
  auto memory_view_of(const Json& params, std::string* view) -> bool {
-@@ -713,10 +737,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+@@ -714,10 +738,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
      for (size_t i = 0; i < bytes.size(); ++i) {
        const auto address =
            static_cast<uint16_t>(addr + static_cast<int64_t>(i));
@@ -137,10 +139,10 @@ index a1349e7..2c60787 100644
      Json result;
      result["written"] = bytes.size();
 diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
-index 8dba521..dd07391 100644
+index 1f7d4d10..2a81b6f6 100644
 --- a/tests/test_agent_commands.cpp
 +++ b/tests/test_agent_commands.cpp
-@@ -167,16 +167,27 @@ auto base64_decode(const std::string& text) -> std::vector<uint8_t> {
+@@ -162,16 +162,27 @@ auto base64_decode(const std::string& text) -> std::vector<uint8_t> {
    return out;
  }
  
@@ -167,8 +169,8 @@ index 8dba521..dd07391 100644
 +  }
  }
  
- // The joystick has no query of its own, so its save state is how a test sees
-@@ -536,6 +547,272 @@ TEST_CASE("Agent: mem_write refuses a payload it cannot place") {
+ auto screen_hash() -> uint64_t {
+@@ -553,6 +564,272 @@ TEST_CASE("Agent: mem_write refuses a payload it cannot place") {
              .get<std::string>() == "3q2+7w==");
  }
  
@@ -282,8 +284,8 @@ index 8dba521..dd07391 100644
 +}  // namespace
 +
 +TEST_CASE("Agent: the running program agrees with a cpu-view read") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  mem_reset_paging();
 +
 +  constexpr uint8_t by_program = 0x11;
@@ -314,8 +316,8 @@ index 8dba521..dd07391 100644
 +}
 +
 +TEST_CASE("Agent: every language-card switch leaves cpu view telling truth") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  mem_reset_paging();
 +
 +  // Three different bytes in the three places $DA80 can be: the two banks the
@@ -358,8 +360,8 @@ index 8dba521..dd07391 100644
 +}
 +
 +TEST_CASE("Agent: the aux view is the bank the program wrote") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  mem_reset_paging();
 +
 +  // $C005 sends writes to the auxiliary bank and $C004 sends them back to
@@ -406,8 +408,8 @@ index 8dba521..dd07391 100644
 +}
 +
 +TEST_CASE("Agent: an aux write survives the page being swapped out") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  mem_reset_paging();
 +
 +  // The same trap as the language card, one bank over. While 80STORE and PAGE2
@@ -439,8 +441,8 @@ index 8dba521..dd07391 100644
 +}
 +
  TEST_CASE("Agent: disk_insert checks the drive and the path length") {
-   TestConfig_t test_config(TestConfig_t::disk_ii_only());
-   HeadlessHarness_t harness(test_config);
+   TestConfig test_config(TestConfig::disk_ii_only());
+   HeadlessHarness harness(test_config);
 -- 
 2.53.0
 

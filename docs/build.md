@@ -4,30 +4,34 @@
 
 ## What the patches do
 
-`patches/` holds nine commits against [LinApple](https://github.com/linappleii/linapple)
+`patches/` holds seven commits against [LinApple](https://github.com/linappleii/linapple)
 (CMake + SDL3 tree). They add `src/frontends/common/agent/` — a Unix socket
 control channel — plus the tests for it, and fix what those tests found. They
 are `git format-patch` output, so `git am` applies them.
 
-> **They are against upstream `master` at `3c00687` (2026-09-20).** A fresh
-> clone plus these nine gives tree hash `a58c66d`, the same as the branch they
-> were made from. From that tree `ctest` is **65/65** (the base is 64; the
-> series adds `test-agent-commands`), **all five frontends build with 0
-> errors** — sdl1, sdl2, sdl3, tui, headless — and sdl3 and headless each pass
-> `dev/smoke.sh` 9/9. If upstream has moved again since and a patch refuses,
-> `git checkout 3c00687` first and the series applies as it did here.
+> **They are against upstream `master` at `86bee1c` (2026-10-10).** A fresh
+> clone plus these seven gives tree hash `f348b23`, the same as the branch they
+> were made from. From that tree `ctest` is **118/118** (the base is 117; the
+> series adds `test-agent-commands`), also under ASAN and UBSAN, **all five
+> frontends build with 0 errors** — sdl1, sdl2, sdl3, tui, headless — and sdl3
+> and headless each pass `dev/smoke.sh` 9/9. If upstream has moved again since
+> and a patch refuses, `git checkout 86bee1c` first and the series applies as
+> it did here.
+>
+> The series used to be nine commits on `3c00687`. Two of them fixed slot 0's
+> peripherals reading each other's commands; upstream merged its own version
+> of that fix (command subsystems and `peripheral_command_by_id`), so they were
+> dropped when the series moved.
 
 | | |
 |---|---|
 | 0001 | the agent socket control channel |
 | 0002 | refuse an SDL3 recording that would be silent |
 | 0003 | test that a state comes back and a run repeats |
-| 0004 | stop slot 0 peripherals answering each other's commands |
-| 0005 | let a caller name the peripheral it means |
-| 0006 | close four gaps in the agent tests |
-| 0007 | let a caller read the memory the program is actually reading (`view`) |
-| 0008 | mark a page an agent write changed, and ask the 6502 about it |
-| 0009 | read the screen off a real program; say what a run and a state promise |
+| 0004 | close four gaps in the agent tests |
+| 0005 | let a caller read the memory the program is actually reading (`view`) |
+| 0006 | mark a page an agent write changed, and ask the 6502 about it |
+| 0007 | read the screen off a real program; say what a run and a state promise |
 
 ## Dependencies
 
@@ -70,8 +74,8 @@ SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
 
 ## Tests
 
-56 cases, 0.1 s, no game disk needed. They are built only when `ENABLE_AGENT`
-is on.
+50 cases, about five seconds (two of them boot the ROM to Applesoft), no
+game disk needed. They are built only when `ENABLE_AGENT` is on.
 
 ```bash
 cmake -B build-tests -G Ninja -DFRONTEND=headless -DBUILD_TESTING=ON

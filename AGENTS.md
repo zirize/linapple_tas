@@ -48,7 +48,7 @@ Rough sizes, so you can budget:
 Do not compare against a value you expect — ask the machine. Plant a small 6502
 routine, let it read the address and store the answer somewhere unbanked, run a
 frame, and read that. `docs/memory.md` has the six instructions. This is how
-the bug in patch 0008 was found, after forty-seven tests had missed it for ten
+the bug in patch 0006 was found, after forty-seven tests had missed it for ten
 sessions.
 
 ## House style

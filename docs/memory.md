@@ -51,7 +51,7 @@ CPU behind it.
 Before this was fixed, such a write was thrown away at the next bank switch —
 a fraction of a second for a game keeping data in the language card. The
 symptom is nasty: the write reads back correctly, holds while nothing happens,
-and then silently reverts. `mem_write` now marks the page (patch 0008), for a
+and then silently reverts. `mem_write` now marks the page (patch 0006), for a
 write that lands on the live image and not for one that lands in a bank's
 store, where marking would copy the unchanged live page over the write instead.
 

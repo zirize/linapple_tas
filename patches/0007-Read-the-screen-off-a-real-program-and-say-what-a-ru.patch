@@ -1,7 +1,7 @@
-From 1f5508eff74c75babafb99402529fcbda5f83395 Mon Sep 17 00:00:00 2001
+From 508ce8565c5946588e4c7bb722969a80bd96efa6 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 01:48:39 +0900
-Subject: [PATCH 9/9] Read the screen off a real program, and say what a run
+Subject: [PATCH 7/7] Read the screen off a real program, and say what a run
  and a state promise
 
 Three of the gaps left were not bugs but blanks: things the suite had only
@@ -38,16 +38,18 @@ rewind will not reach, so a client can refuse the combination, warn, or insert
 the disk write-protected, which empties the list because then there is nothing
 to disagree with.
 
-56 cases.
+50 cases.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/frontends/common/agent/AgentCommands.cpp |  68 ++++-
  tests/test_agent_commands.cpp                | 250 +++++++++++++++++++
  2 files changed, 311 insertions(+), 7 deletions(-)
 
 diff --git a/src/frontends/common/agent/AgentCommands.cpp b/src/frontends/common/agent/AgentCommands.cpp
-index 2c60787..6358cbd 100644
+index 3dc84784..e7b13ac2 100644
 --- a/src/frontends/common/agent/AgentCommands.cpp
 +++ b/src/frontends/common/agent/AgentCommands.cpp
 @@ -205,10 +205,25 @@ auto memory_view_of(const Json& params, std::string* view) -> bool {
@@ -78,7 +80,7 @@ index 2c60787..6358cbd 100644
 +// Either way the caller's turbo setting is put back: it belongs to the person
 +// at the window, not to the command.
  auto step_frames(uint32_t frames, bool deterministic) -> uint64_t {
-   const AppMode_t saved_mode = g_state.mode;
+   const AppMode saved_mode = system_state.mode;
    const bool saved_turbo = linapple_get_turbo();
 @@ -432,6 +447,34 @@ auto disk_status_json() -> Json {
    return result;
@@ -115,7 +117,7 @@ index 2c60787..6358cbd 100644
  // --- command table ---------------------------------------------------------
  
  const std::array<const char*, 24> command_names = {
-@@ -573,12 +616,13 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+@@ -575,12 +618,13 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
      if (frames < 0 || static_cast<uint64_t>(frames) > max_step_frames) {
        return make_error(request, "frames out of range");
      }
@@ -128,10 +130,10 @@ index 2c60787..6358cbd 100644
      result["frames"] = frames;
      result["cycles"] = executed;
 +    result["deterministic"] = deterministic;
-     result["mode"] = mode_name(g_state.mode);
+     result["mode"] = mode_name(system_state.mode);
      return make_ok(request, result);
    }
-@@ -786,6 +830,13 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+@@ -787,6 +831,13 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
        return make_error(request, "max_frames or chunk out of range");
      }
  
@@ -145,7 +147,7 @@ index 2c60787..6358cbd 100644
      const uint64_t started_as = screen_page_hash();
      uint64_t previous = started_as;
      uint64_t executed = 0;
-@@ -808,7 +859,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+@@ -809,7 +860,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
  
      while (spent < max_frames) {
        const auto chunk_started = std::chrono::steady_clock::now();
@@ -154,15 +156,15 @@ index 2c60787..6358cbd 100644
        spent += chunk;
        if (duty_percent < 100) {
          const auto worked = std::chrono::steady_clock::now() - chunk_started;
-@@ -839,6 +890,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+@@ -840,6 +891,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
      result["cycles"] = executed;
      result["changed"] = changed;
      result["hash"] = previous;
 +    result["deterministic"] = deterministic;
-     result["mode"] = mode_name(g_state.mode);
+     result["mode"] = mode_name(system_state.mode);
      return make_ok(request, result);
    }
-@@ -954,6 +1006,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+@@ -955,6 +1007,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
      save_state_save();
      Json result;
      result["path"] = std::string(save_state_get_filename());
@@ -170,7 +172,7 @@ index 2c60787..6358cbd 100644
      return make_ok(request, result);
    }
  
-@@ -965,6 +1018,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
+@@ -966,6 +1019,7 @@ auto dispatch(const std::string& cmd, const Json& params, const Json& request)
      save_state_load();
      Json result;
      result["path"] = std::string(save_state_get_filename());
@@ -179,7 +181,7 @@ index 2c60787..6358cbd 100644
    }
  
 diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
-index dd07391..b8a22fb 100644
+index 2a81b6f6..15364cc0 100644
 --- a/tests/test_agent_commands.cpp
 +++ b/tests/test_agent_commands.cpp
 @@ -17,6 +17,9 @@
@@ -192,7 +194,7 @@ index dd07391..b8a22fb 100644
  #include <string>
  #include <vector>
  
-@@ -1366,6 +1369,95 @@ TEST_CASE("Agent: screen_text reads 80 columns out of both banks") {
+@@ -1354,6 +1357,95 @@ TEST_CASE("Agent: screen_text reads 80 columns out of both banks") {
    CHECK(narrow.at("lines").at(0).get<std::string>().substr(0, 5) == "12345");
  }
  
@@ -228,8 +230,8 @@ index dd07391..b8a22fb 100644
 +  // own font into hi-res and never touches the text page, so the command has
 +  // never been read off a program that was actually printing. Applesoft is in
 +  // ROM and prints in exactly the way the command claims to read.
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  auto disk = TestFixtures::create_ephemeral("minimal.dsk");
 +  harness.mount_disk(6, 0, disk);
 +  harness.boot();
@@ -264,8 +266,8 @@ index dd07391..b8a22fb 100644
 +  // odd ones out of main, and until now it had only ever been shown the bytes
 +  // this file poked into those banks. PR#3 hands the screen to the //e's own
 +  // 80-column firmware, which puts them there itself.
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  auto disk = TestFixtures::create_ephemeral("minimal.dsk");
 +  harness.mount_disk(6, 0, disk);
 +  harness.boot();
@@ -286,10 +288,10 @@ index dd07391..b8a22fb 100644
 +}
 +
  TEST_CASE("Agent: screen_hires hands back the page byte for byte") {
-   TestConfig_t test_config(TestConfig_t::disk_ii_only());
-   HeadlessHarness_t harness(test_config);
-@@ -1470,6 +1562,78 @@ TEST_CASE("Agent: a deterministic run gives the turbo setting back") {
-   ok_result("turbo_set", {{"turbo", false}});
+   TestConfig test_config(TestConfig::disk_ii_only());
+   HeadlessHarness harness(test_config);
+@@ -1464,6 +1556,78 @@ TEST_CASE("Agent: a deterministic run gives the turbo setting back") {
+   CHECK(linapple_set_disk_turbo(true));
  }
  
 +TEST_CASE("Agent: a frame is a length of time only if the run was asked to be") {
@@ -297,8 +299,8 @@ index dd07391..b8a22fb 100644
 +  // workspace but the TAS recorder passes deterministic=false, so what the
 +  // path they use actually promises had never been written down. It is this:
 +  // not much, and a hundred times not much.
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  select_text_page1();
 +  run_program(0x0300, program_idle);
 +
@@ -333,8 +335,8 @@ index dd07391..b8a22fb 100644
 +}
 +
 +TEST_CASE("Agent: a wait runs flat out unless it is told not to") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  select_text_page1();
 +  run_program(0x0300, program_idle);
 +  ok_result("turbo_set", {{"turbo", true}});
@@ -364,10 +366,10 @@ index dd07391..b8a22fb 100644
 +  CHECK(ok_result("status").at("turbo").get<bool>() == false);
 +}
 +
- // --- slot 0 shares one id space ---------------------------------------------
+ // --- save states and repeating a run ---------------------------------------
  
- namespace {
-@@ -1699,6 +1863,92 @@ TEST_CASE("Agent: the same state and the same inputs run the same way") {
+ TEST_CASE("Agent: a save state puts the machine back where it was") {
+@@ -1550,6 +1714,92 @@ TEST_CASE("Agent: the same state and the same inputs run the same way") {
    CHECK(*mem_get_main_ptr(0x0400) != first.cell);
  }
  
@@ -391,8 +393,8 @@ index dd07391..b8a22fb 100644
 +}  // namespace
 +
 +TEST_CASE("Agent: a state rewinds the machine and not the disk in the drive") {
-+  TestConfig_t test_config(TestConfig_t::disk_ii_only());
-+  HeadlessHarness_t harness(test_config);
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
 +  StateFileFixture_t state_file;
 +  auto disk = TestFixtures::create_ephemeral("minimal.dsk");
 +  harness.mount_disk(6, 0, disk);
