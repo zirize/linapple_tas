@@ -1,7 +1,7 @@
 From 5091e536f5acd5f262a83ff48229f11d099050e4 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Fri, 18 Sep 2026 14:17:47 +0900
-Subject: [PATCH 3/7] Test that a state comes back and that a run repeats
+Subject: [PATCH 3/8] Test that a state comes back and that a run repeats
 
 Everything the recorder does rests on two things nothing checked: that a save
 state puts the machine back where it was, and that the same state with the

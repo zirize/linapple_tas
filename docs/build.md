@@ -4,15 +4,15 @@
 
 ## What the patches do
 
-`patches/` holds seven commits against [LinApple](https://github.com/linappleii/linapple)
+`patches/` holds eight commits against [LinApple](https://github.com/linappleii/linapple)
 (CMake + SDL3 tree). They add `src/frontends/common/agent/` — a Unix socket
 control channel — plus the tests for it, and fix what those tests found. They
 are `git format-patch` output, so `git am` applies them.
 
 > **They are against upstream `master` at `86bee1c` (2026-10-10).** A fresh
-> clone plus these seven gives tree hash `f348b23`, the same as the branch they
+> clone plus these eight gives tree hash `573c9a0`, the same as the branch they
 > were made from. From that tree `ctest` is **118/118** (the base is 117; the
-> series adds `test-agent-commands`), also under ASAN and UBSAN, **all five
+> series adds `test-agent-commands`). On the first seven, also under ASAN and UBSAN, **all five
 > frontends build with 0 errors** — sdl1, sdl2, sdl3, tui, headless — and sdl3
 > and headless each pass `dev/smoke.sh` 9/9. If upstream has moved again since
 > and a patch refuses, `git checkout 86bee1c` first and the series applies as
@@ -32,6 +32,7 @@ are `git format-patch` output, so `git am` applies them.
 | 0005 | let a caller read the memory the program is actually reading (`view`) |
 | 0006 | mark a page an agent write changed, and ask the 6502 about it |
 | 0007 | read the screen off a real program; say what a run and a state promise |
+| 0008 | save the language-card bank that is paged in, not its stale store |
 
 ## Dependencies
 

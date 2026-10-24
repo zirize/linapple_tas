@@ -1,0 +1,100 @@
+From 7149492d4b6a7337c7d7db996f0dd727294bea30 Mon Sep 17 00:00:00 2001
+From: zirize <zirize@gmail.com>
+Date: Sat, 24 Oct 2026 09:07:06 +0900
+Subject: [PATCH 8/8] Save the language-card bank that is paged in, not its
+ store
+
+mem_get_snapshot asked mem_get_main_ptr for each page at its own address.
+That finds the live page only where a page runs at the address it is
+stored at, and language-card bank 1 runs at $D000-$DFFF while it is stored
+at $C000-$CFFF of the main image. With the bank paged in, a save took the
+bank as it was at the last switch: an edit made since - by the program or
+through a cpu-view write - was lost, and the state loaded as an older one.
+
+Take the stores whole and lay each live page over the store it is shadowed
+from. A test writes through bank 1, edits the byte with the bank still in,
+saves, overwrites, loads, and reads the edit back; without the fix it reads
+the byte from before the edit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apple2/Memory.cpp         | 24 +++++++++++++++++++-----
+ tests/test_agent_commands.cpp | 27 +++++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+), 5 deletions(-)
+
+diff --git a/src/apple2/Memory.cpp b/src/apple2/Memory.cpp
+index 0364f349..7bcff3e1 100644
+--- a/src/apple2/Memory.cpp
++++ b/src/apple2/Memory.cpp
+@@ -1410,11 +1410,25 @@ auto mem_get_snapshot(SsBaseMemory* snapshot) -> uint32_t {
+   snapshot->mem_mode = active_memory->mem_mode;
+   snapshot->last_write_ram = active_memory->last_write_ram ? 1 : 0;
+ 
+-  for (uint32_t offset = 0x0000; offset < MEMORY_64K; offset += PAGE_SIZE) {
+-    memcpy(snapshot->mem_main + offset,
+-           mem_get_main_ptr(static_cast<uint16_t>(offset)), PAGE_SIZE);
+-    memcpy(snapshot->mem_aux + offset,
+-           mem_get_aux_ptr(static_cast<uint16_t>(offset)), PAGE_SIZE);
++  // Take the stores, then lay each live page over the store it is shadowed
++  // from. Asking mem_get_main_ptr page by page is not the same thing: it finds
++  // a live page only at its own address, and language-card bank 2 is shadowed
++  // from $C000-$CFFF of the store while it runs at $D000-$DFFF, so a save
++  // taken with bank 2 paged in got that bank as it was at the last switch.
++  memcpy(snapshot->mem_main, active_memory->memmain, mem_main_size);
++  memcpy(snapshot->mem_aux, active_memory->memaux, mem_aux_size);
++  for (uint32_t page = PAGE_ZERO; page < PAGE_MAX; page++) {
++    const uint8_t* const shadow = active_memory->memshadow[page];
++    const uint8_t* const live = mem + (page << 8);
++    if (shadow >= active_memory->memmain &&
++        shadow < active_memory->memmain + mem_main_size) {
++      memcpy(snapshot->mem_main + (shadow - active_memory->memmain), live,
++             PAGE_SIZE);
++    } else if (shadow >= active_memory->memaux &&
++               shadow < active_memory->memaux + mem_aux_size) {
++      memcpy(snapshot->mem_aux + (shadow - active_memory->memaux), live,
++             PAGE_SIZE);
++    }
+   }
+ 
+   return 0;
+diff --git a/tests/test_agent_commands.cpp b/tests/test_agent_commands.cpp
+index 15364cc0..e66a6412 100644
+--- a/tests/test_agent_commands.cpp
++++ b/tests/test_agent_commands.cpp
+@@ -1659,6 +1659,33 @@ TEST_CASE("Agent: a save state puts the machine back where it was") {
+   CHECK(regs->pc <= 0x0305);
+ }
+ 
++TEST_CASE("Agent: a save state keeps the language-card bank that is paged in") {
++  TestConfig test_config(TestConfig::disk_ii_only());
++  HeadlessHarness harness(test_config);
++  StateFileFixture_t state_file;
++  mem_reset_paging();
++
++  // Bank 1 runs at $D000 but is stored at $C000 of the main image, and the
++  // probe leaves it paged in. An edit made now lives only in the live page
++  // until the next switch, which is where a party record a cheat just wrote
++  // sits while the game waits in a menu. A state saved then has to carry the
++  // edit and not the store's older byte.
++  constexpr uint8_t before_the_edit = 0x31;
++  constexpr uint8_t saved_edit = 0x32;
++  constexpr uint8_t after_the_save = 0x33;
++  run_probe(
++      program_write_via_bank(lc_bank1_rw, banked_address, before_the_edit));
++  mem_write_byte(banked_address, saved_edit, "cpu");
++
++  ok_result("state_save", {{"path", state_file.path}});
++  mem_write_byte(banked_address, after_the_save, "cpu");
++  ok_result("state_load", {{"path", state_file.path}});
++
++  CHECK(mem_read_byte(banked_address, "cpu") == saved_edit);
++  run_probe(program_peek_across_a_switch(lc_bank1_rw, banked_address));
++  CHECK(probe_value() == saved_edit);
++}
++
+ TEST_CASE("Agent: the same state and the same inputs run the same way") {
+   TestConfig test_config(TestConfig::disk_ii_only());
+   HeadlessHarness harness(test_config);
+-- 
+2.53.0
+

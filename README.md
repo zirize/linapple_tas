@@ -48,7 +48,7 @@ against upstream `master` at `86bee1c`.
 ## What is here
 
 ```
-patches/     seven commits against LinApple: the socket, its tests, and the
+patches/     eight commits against LinApple: the socket, its tests, and the
              bugs those tests found
 clients/     the Python client (standard library only, >= 3.10)
 tools/       twelve tools that use it

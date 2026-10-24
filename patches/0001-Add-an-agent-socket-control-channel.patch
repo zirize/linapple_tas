@@ -1,7 +1,7 @@
 From fc15c5c1c72e87ac465ab3f8b6aba44d67c4904b Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Fri, 18 Sep 2026 13:42:14 +0900
-Subject: [PATCH 1/7] Add an agent socket control channel
+Subject: [PATCH 1/8] Add an agent socket control channel
 
 A Unix socket, one JSON request per line, that lets a program drive the
 machine the way a person drives the window: keys and stick, disks, memory

@@ -1,7 +1,7 @@
 From 02708a161c7bc35b942164a371b88471895fca34 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 00:36:36 +0900
-Subject: [PATCH 5/7] Let a caller read the memory the program is actually
+Subject: [PATCH 5/8] Let a caller read the memory the program is actually
  reading
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

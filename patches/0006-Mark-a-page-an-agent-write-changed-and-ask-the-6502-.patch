@@ -1,7 +1,7 @@
 From 669a0a6c3b92487acc59b4c97c5129bec936808f Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 01:40:44 +0900
-Subject: [PATCH 6/7] Mark a page an agent write changed, and ask the 6502
+Subject: [PATCH 6/8] Mark a page an agent write changed, and ask the 6502
  about it
 
 mem_write has been dropping writes. When the page a write lands on is the one

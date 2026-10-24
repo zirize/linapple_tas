@@ -1,7 +1,7 @@
 From 508ce8565c5946588e4c7bb722969a80bd96efa6 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 01:48:39 +0900
-Subject: [PATCH 7/7] Read the screen off a real program, and say what a run
+Subject: [PATCH 7/8] Read the screen off a real program, and say what a run
  and a state promise
 
 Three of the gaps left were not bugs but blanks: things the suite had only

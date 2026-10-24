@@ -1,7 +1,7 @@
 From 7a4c5f021990fc35cb96c8a666fb61276c43c643 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Fri, 18 Sep 2026 14:44:38 +0900
-Subject: [PATCH 4/7] Close the last four gaps in the agent tests
+Subject: [PATCH 4/8] Close the last four gaps in the agent tests
 
 All four were areas only a real game had ever exercised, which is the slowest
 place to find out they had broken.

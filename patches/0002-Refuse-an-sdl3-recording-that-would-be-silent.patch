@@ -1,7 +1,7 @@
 From 0d5f4b2d562caa85e40870d3b03f62ee99120038 Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Fri, 18 Sep 2026 13:58:31 +0900
-Subject: [PATCH 2/7] Refuse an sdl3 recording that would be silent
+Subject: [PATCH 2/8] Refuse an sdl3 recording that would be silent
 
 The mixer's samples reach the dumper from the sound card's callback, so a
 session that never opened a device would write a WAV of nothing at all,
