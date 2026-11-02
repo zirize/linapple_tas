@@ -1,4 +1,4 @@
-From 02708a161c7bc35b942164a371b88471895fca34 Mon Sep 17 00:00:00 2001
+From 539942a165fd30de0fffb3f0319154d3dfb6b3cb Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 00:36:36 +0900
 Subject: [PATCH 5/8] Let a caller read the memory the program is actually

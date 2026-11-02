@@ -9,13 +9,13 @@
 control channel — plus the tests for it, and fix what those tests found. They
 are `git format-patch` output, so `git am` applies them.
 
-> **They are against upstream `master` at `86bee1c` (2026-10-10).** A fresh
-> clone plus these eight gives tree hash `573c9a0`, the same as the branch they
+> **They are against upstream `master` at `7f4b608` (2026-10-26).** A fresh
+> clone plus these eight gives tree hash `b1c6acc`, the same as the branch they
 > were made from. From that tree `ctest` is **118/118** (the base is 117; the
-> series adds `test-agent-commands`). On the first seven, also under ASAN and UBSAN, **all five
+> series adds `test-agent-commands`), also under ASAN and UBSAN; **all five
 > frontends build with 0 errors** — sdl1, sdl2, sdl3, tui, headless — and sdl3
-> and headless each pass `dev/smoke.sh` 9/9. If upstream has moved again since
-> and a patch refuses, `git checkout 86bee1c` first and the series applies as
+> passes `dev/smoke.sh` 9/9. If upstream has moved again since
+> and a patch refuses, `git checkout 7f4b608` first and the series applies as
 > it did here.
 >
 > The series used to be nine commits on `3c00687`. Two of them fixed slot 0's

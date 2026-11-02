@@ -43,7 +43,7 @@ the machine did the arithmetic. everything is wired up.
 ```
 
 Building the patched emulator: [docs/build.md](docs/build.md). The patches are
-against upstream `master` at `86bee1c`.
+against upstream `master` at `7f4b608`.
 
 ## What is here
 
