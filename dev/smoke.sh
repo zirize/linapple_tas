@@ -28,14 +28,17 @@ say() { printf '%-34s %s\n' "$1" "$2"; }
 ok()  { say "$1" "ok"; }
 bad() { say "$1" "FAIL"; [ -n "${2:-}" ] && printf '%s\n' "$2" | sed 's/^/    /'; fail=1; }
 
-cleanup() { [ -n "${HOLD:-}" ] && kill "$HOLD" 2>/dev/null; rm -rf "$WORK"; }
+# The held session turns SIGTERM into an ordinary exit, so its finally runs
+# s.stop() and the emulator quits; wait so the script does not end before it.
+cleanup() { [ -n "${HOLD:-}" ] && kill "$HOLD" 2>/dev/null && wait "$HOLD" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 # A session held open for every step below, parked at the Applesoft prompt.
 python3 - "$BINARY" "$DISK" "$SOCK" >"$WORK/hold.log" 2>&1 <<'PY' &
-import sys, time
+import signal, sys, time
 sys.path.insert(0, "clients/python")
 from linapple_client import EmulatorSession
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 binary, disk, sock = sys.argv[1:4]
 s = EmulatorSession(binary, socket_path=sock, disk1=disk, autoboot=True)
 c = s.start()

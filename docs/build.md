@@ -14,7 +14,7 @@ are `git format-patch` output, so `git am` applies them.
 > were made from. From that tree `ctest` is **118/118** (the base is 117; the
 > series adds `test-agent-commands`), also under ASAN and UBSAN; **all five
 > frontends build with 0 errors** — sdl1, sdl2, sdl3, tui, headless — and sdl3
-> passes `dev/smoke.sh` 9/9. If upstream has moved again since
+> and headless each pass `dev/smoke.sh` 9/9. If upstream has moved again since
 > and a patch refuses, `git checkout 7f4b608` first and the series applies as
 > it did here.
 >
