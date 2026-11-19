@@ -1,4 +1,4 @@
-From d3c7c1eefd7288bbb9dbe4a1efdad963b4b11baf Mon Sep 17 00:00:00 2001
+From 11495db7cc095e3928f951e6edb9f769825b187c Mon Sep 17 00:00:00 2001
 From: zirize <zirize@gmail.com>
 Date: Sat, 19 Sep 2026 01:48:39 +0900
 Subject: [PATCH 7/8] Read the screen off a real program, and say what a run
